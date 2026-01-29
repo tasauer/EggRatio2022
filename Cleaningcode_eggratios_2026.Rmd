@@ -1,0 +1,355 @@
+---
+title: "Eggratio_cleaning_2026"
+output: html_document
+date: "2026-01-29"
+---
+
+This is the data cleaning file for the egg ratio analyses. Raw egg count data for each species is merged and cleaned, then joined with parasite prevalence data and spatial data from 2022 field season. Parasite prevalence data was previously cleaned (this is the masterfile, downloaded from Google Drive June 2023). 
+
+Note January 2026: This code has been run & checked by TAS 1/29/26, with the exception of redoing manual corrections. This means that I was double checking the later half of the code based on previous cleaning & manual edits done June/July 2023. 
+
+```{r, loading_libraries}
+#loading all necessary libraries for the following code 
+library(dplyr)
+library(lubridate)
+
+```
+
+Read in all the files, after setting working directory manually in RStudio
+
+```{r}
+
+#egg count data files 
+dentifera_raw<-read.csv(file="Data/dent_egg_ratios.csv",header=T)
+retro_raw<-read.csv(file="Data/retro_egg_ratios.csv",header=T)
+ambigua_raw<-read.csv(file="Data/ambigua_egg_ratios.csv",header=T)
+cerio_raw<-read.csv(file="Data/cerio_egg_ratios.csv",header=T)
+dubia_raw<-read.csv(file="Data/dubia_egg_ratios.csv",header=T)
+mendotae_raw<-read.csv(file="Data/mend_egg_ratios.csv",header=T)
+pulicaria_raw<-read.csv(file="Data/pulicaria_egg_ratios.csv",header=T)
+parv_raw<-read.csv(file="Data/parv_egg_ratios.csv",header=T)
+
+#spatial data for spatial autocorrelation tests (in the future)
+spatial_data <- read.csv(file="Data/lake_coordinates.csv",header=T)
+
+#cleaned prevalence data 
+prev_data <- read.csv(file="Data/Clean-Data-2014-2022.csv", header=T)
+
+```
+
+The prevalence data does not need cleaning (previously cleaned before being uploaded to Google drive).
+Make sure the data is subsetted to include only 2022. 
+Note: in this cleaning file, this file will only be used to verify the spellings and groupings of parasites. Since the egg ratio and prevalence data will have to be merged based on egg count averages I will not include that code here. 
+
+```{r, cleaning_subsetting_prev_data}
+prev_2022 <- prev_data[prev_data$Year==2022, ]
+head(prev_2022)
+
+```
+
+
+Now to clean the egg count data set
+First, check all the unique inputs for host species, parasite and lake name to insure no clerical errors
+```{r, cleaning_terms_and_dates} 
+#combine all the individual hosts data sets
+raw_combined <- rbind(dentifera_raw, retro_raw, ambigua_raw, cerio_raw, dubia_raw, mendotae_raw, pulicaria_raw, parv_raw)
+all_hosts <- raw_combined
+
+#Host Species
+unique(all_hosts$Host.Species) 
+#The only unexpected entry is "Dubia/Mendotae", which is an unclear 
+nrow(all_hosts[all_hosts$Host.Species=="Dubia/Mendotae",]) #72 entries of this classification
+
+#Parasite
+unique(all_hosts$Parasite) 
+#There are just so many entries that are unclear here
+#For now, discard any uncertain entries (ex. "Larsonnia-esque thing", "coke like but not in the gut", etc)
+#I will make two final datasets; one that includes co-infections and one that excludes them 
+##MISPELLINGS: There is at least one "Red Sprio" that should be "Red Spiro 
+
+unique(all_hosts$Lake.Name)
+#There are several errors in this category
+#There are two Crooked P entries; one with a space after the P and one without
+#Similar error to above with Cedar, Crooked W, woodland
+#There is also an entry to Cerio, which does not belong in this column 
+all_hosts[all_hosts$Lake.Name=="Cerio",] #78 entries, all on the same date processed by the same person
+#This was a Mill & Walsh day; I checked the raw data sheets and found that this sample, processed by MKD, is from Walsh
+#Replace all cerio Lakes with Walsh
+
+
+###START CLEANING### 
+#First, change all the ambiguous host species
+#All dubia/Mednotae entries were made on the same date by KJM
+#Rather than removing the date, I am going to change them based on the rest of the entries for Woodland 
+Woodland<- all_hosts[all_hosts$Lake.Name=="Woodland",]
+#Based on the rest of the entries for Woodland, there are many more mendotae
+LV_hosts<-all_hosts$Host.Species=="Dubia/Mendotae"
+
+
+#try to correct spelling using mutate function (in dplyr package)
+
+all_hosts <- all_hosts %>% 
+mutate(Host.Species = case_when(
+        Host.Species %in% "Dubia/Mendotae" ~ "Mendotae"
+        ,TRUE ~ Host.Species
+        )
+    )
+unique(all_hosts$Host.Species) 
+# this correction worked! Absolutely not the easiest way to do this with a single mispelling, but it would be helpful for multiple misspellings 
+
+#Complete spelling corrections for Lakes 
+#Remove all possible spacing from Crooked P
+all_hosts <- all_hosts %>% 
+mutate(Lake.Name = case_when(
+        Lake.Name %in% c("Crooked P ", "Crooked P") ~ "Crooked_P"
+        ,TRUE ~ Lake.Name
+        )
+    )
+
+#Remove all possible spacing from Crooked W
+all_hosts <- all_hosts %>% 
+mutate(Lake.Name = case_when(
+        Lake.Name %in% c("Crooked W ", "Crooked W") ~ "Crooked_W"
+        ,TRUE ~ Lake.Name
+        )
+    )
+
+#Remove all possible spacing from Little Appleton 
+all_hosts <- all_hosts %>% 
+mutate(Lake.Name = case_when(
+        Lake.Name %in% "Little Appleton" ~ "Little_Appleton"
+        ,TRUE ~ Lake.Name
+        )
+    )
+
+#Remove spacing from end of cedar
+#Remove all possible spacing from Little Appleton 
+all_hosts <- all_hosts %>% 
+mutate(Lake.Name = case_when(
+        Lake.Name %in% "Cedar " ~ "Cedar"
+        ,TRUE ~ Lake.Name
+        )
+    )
+
+#Remove spacing from end of cedar
+#Remove all possible spacing from Little Appleton 
+all_hosts <- all_hosts %>% 
+mutate(Lake.Name = case_when(
+        Lake.Name %in% "Woodland " ~ "Woodland"
+        ,TRUE ~ Lake.Name
+        )
+    )
+
+#Fix error discussed above where Walsh is labeled as Cerio
+all_hosts <- all_hosts %>% 
+mutate(Lake.Name = case_when(
+        Lake.Name %in% "Cerio" ~ "Walsh"
+        ,TRUE ~ Lake.Name
+        )
+    )
+
+
+unique(all_hosts$Lake.Name) #Only 15 unique lakes, all spelled correctly
+
+#Now moving onto parasites
+#First fix the spelling and combine classifications where appropriate
+#Then create a subset that only includes the parasites we have in cleaned field data
+Field_data<-read.csv(file="Data/Clean-Data-2014-2022.csv",header=T)
+colnames(Field_data)
+parasites <- c("Uninfected", "Past", "Metsch", "Spiro", "Brood", "Larssonia", "Spider", "Gurleya", "Caullerya","micG","Coke")
+
+
+#Fix spellings and spacings, combine classes where appropriate
+unique(all_hosts$Parasite) 
+
+all_hosts <- all_hosts %>% 
+mutate(Parasite = case_when(
+        Parasite %in% "Caullerya " ~ "Caullerya"
+        ,TRUE ~ Parasite
+        )
+    )
+#Uninfected 
+
+all_hosts <- all_hosts %>% 
+mutate(Parasite = case_when(
+        Parasite %in% "Uninfected " ~ "Uninfected"
+        ,TRUE ~ Parasite
+        )
+    )
+#larsonnia
+all_hosts <- all_hosts %>% 
+mutate(Parasite = case_when(
+        Parasite %in% "Larsonnia " ~ "Larsonnia"
+        ,TRUE ~ Parasite
+        )
+    )
+#Spiderman
+all_hosts <- all_hosts %>% 
+mutate(Parasite = case_when(
+        Parasite %in% "Spiderman" ~ "Spider"
+        ,TRUE ~ Parasite
+        )
+    )
+#Spiro; here I will fix spelling and combine all colors spiro to just spiro
+all_hosts <- all_hosts %>% 
+mutate(Parasite = case_when(
+        Parasite %in% c("Red Sprio", "White Spiro", "Red Spiro", "Yellow Spiro") ~ "Spiro"
+        ,TRUE ~ Parasite
+        )
+    )
+
+cleaned <- all_hosts[all_hosts$Parasite=="Uninfected"|all_hosts$Parasite=="Past"|all_hosts$Parasite=="Metsch"|all_hosts$Parasite=="Spiro"|all_hosts$Parasite=="Brood"|all_hosts$Parasite=="Larssonia"|all_hosts$Parasite=="Spider"|all_hosts$Parasite=="Gurleya"|all_hosts$Parasite=="Caullerya"|all_hosts$Parasite=="MicG"|all_hosts$Parasite=="Coke",]
+
+unique(cleaned$Parasite)
+
+#remove the notes column for analyses by index number
+cleaned <- cleaned[,-7] 
+
+
+```
+
+Let's fix the date stuff now. I know from working with the data that there are more dates than is possible in the data set. This can originate from two errors
+  1) The date recorded in the data is the date that the sample was processed, not the date the sample was collected. Since different processers handle each lake, there may be two dates recorded for a single sampling day
+  2) In Excel where data was enters, clicking and dragging on one date fills consecutive days rather than copying the same date consecutively. 
+
+I do not know how to tackle all the mistakes directly in r, especially where certain samples may have been attributed to the incorrect sampling date, but not necessarily a sampling date that did not occur (Ex. A sample from Bishop is collected 7/13, but labeled 7/14, which would be the correct sampling date for Whitmore & Woodland)
+
+I am going to try some data exploration in R, then may have to export the merged clean file and manually fix the errors using what I found within r.
+
+```{r, cleaning_dates}
+#We also need to make sure the date is formatted correctly and add julien day
+class(cleaned$Date.Sampled)
+
+#reformat date
+cleaned$Date.Sampled <-format(as.Date(cleaned$Date.Sampled, format="%m/%d/%Y"))
+
+#extract julian day (function in lubridate package)
+cleaned$julian <- yday(cleaned$Date.Sampled)
+
+raw_sample_dates <- unique(cleaned$julian)
+length(raw_sample_dates) #12 dates are in data set that should not be
+
+#check prevalence data dates
+unique(prev_2022$Julian) 
+#there are only 60 here, we can use these to find out which are not supposed to be in egg count data at all
+
+#create vector for real sampling dates
+real_sampling_dates <- unique(prev_2022$Julian)
+
+#find differences between the two vectors
+wrong_dates <- setdiff(raw_sample_dates, real_sampling_dates)
+
+#extract and view rows with incorrect dates
+wrong_dates <- cleaned[cleaned$julian %in% wrong_dates, ] 
+
+unique(wrong_dates$julian)
+
+#inspect this data frame and match to sampling calendar
+#6/8 North samples in these data should be dated 6/7, the date of sample collection 
+#9/1 North samples in these data should be dated 8/31, the date of sample collection
+#10/28 sullivan & Gosling samples in these data should be dated 10/27, the date of sample collection
+#10/7 Woodland samples should be dated 10/6
+#10/21 Woodland samples should be 10/20
+#8/17 sampling at North seems to have been dragged for consecutive dates (accounts for remaining 7 wrong dates, likely includes other sampling dates where North was not sampled but other lakes were (ex. 8.18))
+
+#export the cleaned data set to fix the incorrect dates manually
+#in addition, to checking the above dates, go through and make sure that other dates are labelled correctly
+
+write.csv(cleaned, "Data/eggratio_cleaning_incomplete.csv", row.names=FALSE)
+
+```
+File was exported on 6/30/23 and I finished cleaning it 7/3/2023. Dates were manually checked against the sampling dates listed in the lab Sampling calendar. Any dates which did not match a date where the listed lake was sampled were edited. 
+The manually checked data file is saved in folder as eggration_cleaning_complete_manualedit.csv
+
+Now, I can read in the complete file to finish cleaning it an merging it with prevalence data. I will save a copy of this cleaned merged file with and without ephipphia
+
+```{r}
+
+#read in the manually cleaned file 
+dates_cleaned <- read.csv(file="Data/eggratio_cleaning_complete_manualedit.csv",header=T)
+head(dates_cleaned)
+
+#reformat and check dates & extract julian date (deleted in manually cleaned file)
+
+class(dates_cleaned$Date.Sampled)
+
+#reformat date
+dates_cleaned$Date.Sampled <-format(as.Date(dates_cleaned$Date.Sampled, format="%m/%d/%Y"))
+
+#extract julian day (function in lubridate package)
+dates_cleaned$julian <- yday(dates_cleaned$Date.Sampled)
+
+
+#now we can run checks to verify the data, much like we did above to identify dates written in error
+unique_dates_check <- unique(dates_cleaned$julian) #there are still 61 rather than 60 unique dates in the file 
+
+#find difference between prevalence & cleaned data set again
+
+#find differences between the two vectors
+wrong_dates_2 <- setdiff(unique_dates_check, real_sampling_dates)
+wrong_dates_2
+
+#extract and view rows with incorrect dates
+wrong_dates_2_df <- dates_cleaned[dates_cleaned$julian %in% wrong_dates_2, ] 
+wrong_dates_2_df #there was one date I did not fix in sullivan's samples (10/28 should have been 10/27)
+
+#I fixed the above error again manually and read the data in again; I will overwrite the above data frames with corrected data
+#read in the manually cleaned file 
+dates_cleaned <- read.csv(file="Data/eggratio_cleaning_complete_manualedit_2.csv",header=T)
+head(dates_cleaned)
+
+#reformat and check dates & extract julian date (deleted in manually cleaned file)
+
+class(dates_cleaned$Date.Sampled)
+
+#reformat date
+dates_cleaned$Date.Sampled <-format(as.Date(dates_cleaned$Date.Sampled, format="%m/%d/%Y"))
+
+#extract julian day (function in lubridate package)
+dates_cleaned$julian <- yday(dates_cleaned$Date.Sampled)
+
+
+#now we can run checks to verify the data, much like we did above to identify dates written in error
+unique_dates_check <- unique(dates_cleaned$julian)
+
+##Alright at long last there are only 60 unique sampling dates in the egg ratio data set; now we can finish cleaning and export file
+```
+export cleaned file with & without epphipial eggs 
+
+```{r, cleaning_rm_epphipial_add_spatial}
+
+#duplicate clean data set before removing epphipia 
+clean_with_epphipial <- dates_cleaned
+
+#add spatial data into data set with epphipia
+clean_with_epphipial <- full_join(clean_with_epphipial, spatial_data, by=c("Lake.Name"="Lake")) 
+
+#export epphipia data set
+write.csv(clean_with_epphipial, "Data/cleaned_eggcounts_includesephippial_1_29_26_TAS.csv", row.names=FALSE)
+
+#work on removing epphipia data
+unique(dates_cleaned$Egg.Number)
+sum(dates_cleaned$Egg.Number=="e") # there are 222 ephippial eggs in total
+
+# remove epphipial eggs
+LV_noepphipial <- dates_cleaned$Egg.Number!="e"
+sum(LV_noepphipial)
+
+data_frame <-dates_cleaned[LV_noepphipial,] 
+#new data frame has 16232 observations, which matches the removal of 222 observations from the cleaned data frame
+
+class(data_frame$Egg.Number)
+unique(data_frame$Egg.Number)
+data_frame$Egg.Number<- as.numeric(data_frame$Egg.Number)
+
+## Adding in spatial data to test for spatial autocorrelation in models later on 
+data_frame <- full_join(data_frame, spatial_data, by=c("Lake.Name"="Lake")) 
+
+#sum eggs for funs
+sum(data_frame$Egg.Number)
+
+#export cleaned file
+write.csv(data_frame, "Data/cleaned_eggcounts_noephippia_1_29_26_TAS.csv", row.names=FALSE)
+
+```
+
