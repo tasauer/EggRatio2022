@@ -1,0 +1,478 @@
+---
+title: "EggRatio_analyses2025"
+output: html_document
+date: "2025-02-03"
+---
+
+This markdown includes analyses & visualization for 2022 field data. I am using data which was cleaned using "Cleaningcode_eggratios_2026.Rmd". 
+```{r, load_libraries}
+#libraries
+library(ggplot2)
+library(dplyr)
+library(emmeans)
+library(glmmTMB)
+library(remotes)
+library(DHARMa)
+library(ggpubr)
+library(tidyr)
+library(pscl)
+library(boot)
+library(MASS)
+#install.packages("boot")
+#install.packages("Matrix", version="1.6-2")
+#install.packages("DHARMa")
+#install.packages("remotes")
+#install.packages("ggpubr")
+#install.packages("pscl")
+```
+I am working with egg count data saved as cleaned_eggcounts_includesephippial_1_29_26_tas.csv. 
+```{r, data_read}
+#cleaned egg count data
+all_data <- read.csv(file="Data/cleaned_eggcounts_includesephippial_1_29_26_TAS.csv", header=T)
+head(all_data)
+```
+
+Remove ephippia & observations past sexual selection for cerio & dentifera
+```{r, ephippia_and_ephippiadates}
+#Epphipia are included in these data. Since we are doing a comparison of egg counts, we won't be using those observations. However, since the start of sexual reproduction might also skew the frequency of eggs in general, I am going to remove all observations after the onset of sexual reproduction for dentifera & cerio in the fall. 
+
+#Prior to removing all ephippia, use theme to determine the likely onset of sexual reproduction in the populations. 
+dent <- all_data[all_data$Host.Species=="Dentifera"&all_data$Egg.Number=="e",]
+cerio <- all_data[all_data$Host.Species=="Cerio"&all_data$Egg.Number=="e",]
+
+#identify all unique julian dates for ephippial dent and cerio
+unique(dent$julian)
+unique(cerio$julian)
+#identified the dates that sexual reproduction started: 285 for both cerio and dentifera
+#note: there is an single ephippia at day 158 in dentifera, but I am not going to treat that as the start date
+
+#filter out these dates
+df <- all_data[!(all_data$Host.Species %in% c("Dentifera", "Cerio") & all_data$julian >= 285), ]
+  #filtering in this way removes 1528 observations
+
+#now to remove remaining ephippia. 
+#create a logical vector for which all non-ephippial individuals are given a 1
+LV_noepphipial <- df$Egg.Number!="e"
+sum(LV_noepphipial) #sum is 14861, meaning there are 61 ephippia observations to remove
+
+df <-df[LV_noepphipial,] 
+#new data frame has 14861 observations, which matches the removal of 61 observations (the remaining ephippial animals)
+
+#double check Egg Number column to ensure that all ephippia have been removed
+class(df$Egg.Number)
+unique(df$Egg.Number)
+
+#reclassify as numeric
+df$Egg.Number<- as.numeric(df$Egg.Number)
+
+#make sure julian is a factor, not an integer
+df$julian <- as.numeric(df$julian)
+
+#check that we didn't filter ALL the large dates out
+unique(df$julian)
+
+
+#check dates for manuscript reasons
+#unique(df$Date.Sampled)
+```
+Now I'll filter out the rare parasites.
+
+```{r, filter_rare_parasites}
+#figure out which parasites we won't be looking at
+table(df$Parasite)
+#output: 
+#Brood  Caullerya       Coke    Gurleya  Larssonia     Metsch       MicG       Past     Spider      Spiro Uninfected 
+ #       57         30       2030         10          4         12       1050        337          1        152      11178 
+#get rid of Caullerya, gurleya, larssonia, metsch, spider
+
+#filter out the parasites of lowest density
+df_filtered <- df[df$Parasite=="Brood"|df$Parasite=="Past"|df$Parasite=="Coke"|df$Parasite=="MicG"|df$Parasite=="Spiro"|df$Parasite=="Uninfected",]
+
+#check that filtering worked
+unique(df_filtered$Parasite)
+
+#add in a month column so that models can be simplified later on
+#set date column to date class
+df_filtered$Date.Sampled <- as.Date(df_filtered$Date.Sampled)
+
+#extract month
+df_filtered$month <- format(df_filtered$Date.Sampled, "%m")
+unique(df_filtered$month)
+```
+"df_filtered" contain all data from observations of uninfected animals as well as 5 parasites which had more than 50 observations over the course of the 2022 field season.
+Create separate dataframes for each of the parasites. Eventually, I will join together the uninfected data with data for each of the parasites, subsetting the uninfected so that only data from dates and lakes where the parasite was found are kept. 
+
+```{r, subset_data}
+#first, split out the original data frame by parasite
+brood_only <- df_filtered[df_filtered$Parasite=="Brood",]
+past_only <- df_filtered[df_filtered$Parasite=="Past",]
+micg_only <-df_filtered[df_filtered$Parasite=="MicG",]
+coke_only <- df_filtered[df_filtered$Parasite=="Coke",]
+spiro_only <- df_filtered[df_filtered$Parasite=="Spiro",]
+uninf_only <- df_filtered[df_filtered$Parasite=="Uninfected",]
+```
+
+Now I need to try properly subsetting the data so that the uninfected animals I'm comparing to infected are ONLY from the lakes, dates and hosts where the infected were found. This is trickier than it seems because if we subset using only logical vectors,then we run into the problem where hosts where infections were not found but were in lakes on a date where brood was found in a different host will still be hanging around. 
+Start with brood since it has the least observations 
+
+DISCLAIMER JAN 2026: I know this is not necessarily the most efficient way to subset in this way! A lot of this cleaning code was done before I became more familiar with dplyr and other data cleaning packages. 
+
+```{r, data_wrangling_brood_test}
+
+#merge brood and uninfected
+brood_test <- rbind(brood_only, uninf_only) #currently contains all the uninfected & brood observations
+
+#concatenate host species, lake & date 
+brood_test$specieslakeday <- paste(brood_test$Host.Species,brood_test$Lake.Name,brood_test$julian)
+
+#now we just need to match specieslakedates of the infected animals with the same for uninfected
+#subset data by whether or not animal is infected
+Ybrood <- dplyr::filter(brood_test, Parasite=="Brood")
+Nbrood <- dplyr::filter(brood_test, Parasite=="Uninfected")
+
+#look in negative dataset to see if the specieslakeday is in the positive data set
+# if it is, test variable will be yes
+Nbrood$test <-  ifelse(Nbrood$specieslakeday %in% Ybrood$specieslakeday, "yes", "no")
+
+#create the test variable in the data set with all infected animals
+Ybrood$test <- "yes"
+
+#recombine data sets so it's brood and uninfected animals
+recombinedbrood <- rbind (Ybrood, Nbrood)
+
+#subset data by the test variable being yes
+brood_proper <- dplyr::filter(recombinedbrood, test=="yes") #final data set has 851 observations
+```
+
+Repeat the above with four other parasites (spiro, past, micg, sprite)
+
+```{r, subsetting_properly}
+#####SPIRO#####
+#merge spiro and uninfected
+spiro_test <- rbind(spiro_only, uninf_only) #currently contains all the uninfected & spiro observations
+
+#concatenate host species, lake & date 
+spiro_test$specieslakeday <- paste(spiro_test$Host.Species,spiro_test$Lake.Name,spiro_test$julian)
+
+#now we just need to match specieslakedates of the infected animals with the same for uninfected
+#subset data by whether or not animal is infected
+Yspiro <- dplyr::filter(spiro_test, Parasite=="Spiro")
+Nspiro <- dplyr::filter(spiro_test, Parasite=="Uninfected")
+
+#look in negative dataset to see if the specieslakeday is in the positive data set
+# if it is, test variable will be yes
+Nspiro$test <-  ifelse(Nspiro$specieslakeday %in% Yspiro$specieslakeday, "yes", "no")
+
+#create the test variable in the data set with all infected animals
+Yspiro$test <- "yes"
+
+#recombine data sets so it's spiro and uninfected animals
+recombinedspiro <- rbind (Yspiro, Nspiro)
+
+#subset data by the test variable being yes
+spiro_proper <- dplyr::filter(recombinedspiro, test=="yes") #final data set has 1146 observations
+
+################################################################################################
+####MICG######
+#merge micg and uninfected
+micg_test <- rbind(micg_only, uninf_only) #currently contains all the uninfected & micg observations
+
+#concatenate host species, lake & date 
+micg_test$specieslakeday <- paste(micg_test$Host.Species,micg_test$Lake.Name,micg_test$julian)
+
+#now we just need to match specieslakedates of the infected animals with the same for uninfected
+#subset data by whether or not animal is infected
+Ymicg <- dplyr::filter(micg_test, Parasite=="MicG")
+Nmicg <- dplyr::filter(micg_test, Parasite=="Uninfected")
+
+#look in negative dataset to see if the specieslakeday is in the positive data set
+# if it is, test variable will be yes
+Nmicg$test <-  ifelse(Nmicg$specieslakeday %in% Ymicg$specieslakeday, "yes", "no")
+
+#create the test variable in the data set with all infected animals
+Ymicg$test <- "yes"
+
+#recombine data sets so it's micg and uninfected animals
+recombinedmicg <- rbind (Ymicg, Nmicg)
+
+#subset data by the test variable being yes
+micg_proper <- dplyr::filter(recombinedmicg, test=="yes") #final data set has 4041 observations
+
+##########################################################################################
+######Sprite
+#merge coke and uninfected
+coke_test <- rbind(coke_only, uninf_only) #currently contains all the uninfected & coke observations
+
+#concatenate host species, lake & date 
+coke_test$specieslakeday <- paste(coke_test$Host.Species,coke_test$Lake.Name,coke_test$julian)
+
+#now we just need to match specieslakedates of the infected animals with the same for uninfected
+#subset data by whether or not animal is infected
+Ycoke <- dplyr::filter(coke_test, Parasite=="Coke")
+Ncoke <- dplyr::filter(coke_test, Parasite=="Uninfected")
+
+#look in negative dataset to see if the specieslakeday is in the positive data set
+# if it is, test variable will be yes
+Ncoke$test <-  ifelse(Ncoke$specieslakeday %in% Ycoke$specieslakeday, "yes", "no")
+
+#create the test variable in the data set with all infected animals
+Ycoke$test <- "yes"
+
+#recombine data sets so it's coke and uninfected animals
+recombinedcoke <- rbind (Ycoke, Ncoke)
+
+#subset data by the test variable being yes
+coke_proper <- dplyr::filter(recombinedcoke, test=="yes") #final data set has 7067 observations
+
+##########################################################################################
+######Past
+#merge past and uninfected
+past_test <- rbind(past_only, uninf_only) #currently contains all the uninfected & past observations
+
+#concatenate host species, lake & date 
+past_test$specieslakeday <- paste(past_test$Host.Species,past_test$Lake.Name,past_test$julian)
+
+#now we just need to match specieslakedates of the infected animals with the same for uninfected
+#subset data by whether or not animal is infected
+Ypast <- dplyr::filter(past_test, Parasite=="Past")
+Npast <- dplyr::filter(past_test, Parasite=="Uninfected")
+
+#look in negative dataset to see if the specieslakeday is in the positive data set
+# if it is, test variable will be yes
+Npast$test <-  ifelse(Npast$specieslakeday %in% Ypast$specieslakeday, "yes", "no")
+
+#create the test variable in the data set with all infected animals
+Ypast$test <- "yes"
+
+#recombine data sets so it's past and uninfected animals
+recombinedpast <- rbind (Ypast, Npast)
+
+#subset data by the test variable being yes
+past_proper <- dplyr::filter(recombinedpast, test=="yes") #final data set has 2084 observations
+```
+
+```{r, rename_datasets}
+brood <-brood_proper
+past <- past_proper
+micg <- micg_proper
+coke <- coke_proper
+spiro <- spiro_proper
+```
+
+___________________________________________________________
+___________________________________________________________
+________________STATS-ZIP MODEL____________________________
+___________________________________________________________
+___________________________________________________________
+
+These data means that they are severely zero-inflated. Zeroes can also represent a true biological "zero" where the individual animal did not have any babies or a "false" zero where the individual had just had babies so their brood chamber was empty. Because of these factors, I think the best way to proceed with analyses is a ZIP (zero-inflated poisson). This is similar in some ways to a hurdle model, except in a ZIP model both groups (both zeroes and non-zeroes) are considered in separate models. 
+
+```{r, pick_terms}
+#get a load of this zero-inflation (coke-only dataset)
+hist(coke$Egg.Number)
+table(coke$Egg.Number)
+
+#we know it's zero-inflated, but what terms should we be including? Are lake/date necessary? I am also collapsing date here into month since I want to simplify the models as much as possible
+#look at lake & month 
+boxplot(Egg.Number ~ Lake.Name, data = df_filtered)
+boxplot(Egg.Number ~ month, data = df_filtered)
+
+#do rough comparison 
+kruskal.test(Egg.Number ~ Lake.Name, data = df_filtered)
+kruskal.test(Egg.Number ~ month, data = df_filtered)
+  #both above tests are significant across all data, indicating that lake & month are likley important inclusions in any models. 
+```
+
+####################SPRITE################################
+First, do preliminary checks to ensure that ZIP/ZINB is appropriate
+```{r, model_checks_coke}
+#Check Outcome variable (Egg Number)
+table(coke$Egg.Number==0)
+mean(coke$Egg.Number==0) #41% of values are zeroes, making a zero-inflated model necessary
+
+#Check for overdispersion
+mean(coke$Egg.Number) #1.094948
+var(coke$Egg.Number)  #1.494097
+  #variance is higher than the mean, meaning overdispersion is present and negative binomial is preferred over poisson
+
+#fit both models and compare goodness-of-fit
+poisson_fit <- glm(Egg.Number ~ Parasite+Host.Species, data=coke, family="poisson")
+nb_fit <- glm.nb(Egg.Number ~ Parasite+Host.Species, data=coke)
+AIC(poisson_fit, nb_fit) #Negative binomial has a lower AIC, it is the more appropriate model. 
+
+
+#fit basic poisson & zero-inflated versions then compare with Vuong test
+zip_fit <- zeroinfl(Egg.Number ~ Parasite+Host.Species | Parasite+Host.Species,data=coke, dist="poisson")
+zinb_fit <- zeroinfl(Egg.Number ~ Parasite+Host.Species | Parasite+Host.Species,data=coke, dist="negbin")
+vuong(zip_fit, poisson_fit) # ZIP vs Poisson
+vuong(zinb_fit, nb_fit)     # ZINB vs NB
+```
+These tests show overwhelmingly that I need a zero-inflated model, and that negative binomial is likely more appropriate than a poisson distribution.
+
+Ok, having tried a bunch of models there are a ton of difficulties with these data. I still think conceptually ZIP/ZINB models are the best way to go, but these models do not want to converge, especially when I try to include Lake & month as random OR fixed effects. 
+Below I am essentially throwing the kitchen sink at the pansporella ("coke") data, running all different types of models that I can think of. 
+1- What I think is the "ideal" model: ZINB with parasite & host species in both models including lake & month as random effects in both count & zero models. 
+2- ZINB model with lake only parasite & host species in both count & zero models
+3- ZINB model with fixed predictor in the zero-inflation term (functionally, this is assuming that any single individual is equally likely to have a structural or sampling zero)
+4-ZINB model with lakes collapsed by some variable
+5-Standard GLM with Negative binomial or poisson distribution on untransformed data
+6- Standard GLM with negative binomial or poisson distribution on data transformed by adding 1 to all Egg Counts 
+
+
+
+
+Now, before trying all these alternative models, I am going to filter out the rare host species for this parasite. I am doing this to simplify the model terms so I can get models to converge. 
+
+```{r}
+#table host species to determine which ones I am excluding
+#first, look at which hosts are the least abundant overall
+table(coke$Host.Species)
+#now look at host and parasite (are there any hosts with very few infections?)
+table(coke$Host.Species, coke$Parasite)
+  #lowest count hosts are cerio & mendotae
+  #NOTE: tried model with only cerio & mendotae excluded but it still failed to converge with all necessary terms included
+  #Try excluding Dubia & ambigua as well (both hosts with less than 100 infections)
+
+#make vector of species I am keeping for analyses
+keep_species <- c("Dubia", "Ambigua","Dentifera","Parvula","Pulicaria","Retrocurva")
+
+#filter out rare host species
+coke_filt <- coke %>% 
+  filter(Host.Species %in% keep_species)
+
+table(coke_filt$Host.Species)
+```
+Try all models
+
+```{r, ZIP_coke}
+
+#1a-What I think is the "ideal" model: ZINB with parasite & host species in both models including lake & month as random effects in both count & zero models. 
+zinb_mod_1a <- glmmTMB(
+  Egg.Number ~ Host.Species+ Parasite+ Host.Species * Parasite + (1|Lake.Name)+(1|month),
+  ziformula = ~ Host.Species + Parasite +Host.Species * Parasite + (1|Lake.Name)+(1|month),       # predictors for zero-inflation
+  family = nbinom2,
+  data = coke_filt
+)
+#this model does not have a prayer of converging unfortunately. After looking into each of this variables individually in test models it seems like a large part of the issue is that some of these factors have "deterministic" zero behavior; in other words, some lakes either always or never have zeroes. This makes the zero-inflation term fail. 
+#If deterministic zero behavior makes a ZINB fail, that also tells me that  I probably won't be able to use this kind of model for parasites where I expect deterministic zeroes for the infection status. In other words, if I expect past & brood-infected animals to nearly always have zeroes (which I know in these data they do), any zero-inflated model that I use will most likely fail. 
+
+#1b
+zinb_mod_1b <- glmmTMB(
+  Egg.Number ~ Host.Species * Parasite+ (1|month),
+  ziformula = ~ Host.Species + Parasite,       # predictors for zero-inflation
+  family = nbinom2,
+  data = coke_filt
+)
+#this model converges!
+#However, it only converges if I take the individual main effects out of the count model and keep the interaction (or keep the individual main effects and exclude the interaction). The later I think is allowed but does not address my question precisely where the former I don't believe is allowed? I don't think you should ever have your interaction term in a model without the individual main effects?
+#Again, when looking at lakes it seems like the major problem is that some lakes are always or never zero; I can potentially collapse lakes to decrease levels but I am not sure the most biologically relevant way to go about that. 
+# I will look at the model summary & all the checks/comparisons later down
+#plot residuals with DHARMa
+sim_res_1b <- simulateResiduals(zinb_mod_1b)
+plot(sim_res_1b) #only KS test significant
+testDispersion(sim_res_1b) #non-significant
+testZeroInflation(sim_res_1b) #ns
+
+
+#2-ZINB model with lake only parasite & host species in both count & zero models
+zinb_mod_2 <- glmmTMB(
+  Egg.Number ~ Host.Species * Parasite + Host.Species+Parasite,
+  ziformula = ~ Host.Species + Parasite+Host.Species*Parasite,       # predictors for zero-inflation
+  family = nbinom2,
+  data = coke_filt
+)
+sim_res_2 <- simulateResiduals(zinb_mod_2)
+plot(sim_res_2) #outlier test significant, residual vs. predicted looks better than 1b
+testDispersion(sim_res_2) #non-significant
+testZeroInflation(sim_res_2) #ns
+
+#this model converges. Again, though, looking at all the data indicate that lake & month are likely important and should be included.
+#3- ZINB model with fixed predictor in the zero-inflation term 
+zinb_mod_3 <- glmmTMB(
+  Egg.Number ~ Host.Species * Parasite + Host.Species+Parasite+(1|month),
+  ziformula = ~ 1,       # predictors for zero-inflation
+  family = nbinom2,
+  data = coke_filt
+)
+#this model only converges if I exclude lakes. Again, lakes are a problem That leads to....
+
+sim_res_3 <- simulateResiduals(zinb_mod_3)
+plot(sim_res_3) #KS & outlier test significant, residual vs. predicted looks real wobbly
+testDispersion(sim_res_3) #non-significant
+testZeroInflation(sim_res_3) #ns
+
+#4-ZINB model with lakes collapsed by some variable
+#how should I collapse the lakes together? Deep/shallow or geographical grouping seems like it could be relevant, but also might be ultimately meaningless. Another option is to build a model looking primariliy lake as a fixed effect then group based on those results, but again when I tried this almost all models failed to converge. 
+
+#5-Standard GLM with Negative binomial or poisson distribution on untransformed data
+zinb_mod_5 <- glmmTMB(
+  Egg.Number ~ Host.Species + Parasite +Host.Species * Parasite +(1|Lake.Name)+(1|month), 
+  family=nbinom2,
+  data = coke_filt
+)
+#test model
+sim_res_5 <- simulateResiduals(zinb_mod_5)
+plot(sim_res_5) #KS test significant, residual vs. predicted somewhat wobbly
+testDispersion(sim_res_5) #non-significant
+testZeroInflation(sim_res_5) #ns
+#this test shows non-significant zero inflation; does that mean I don't need the zero-inflation model at all? But the tests above indicate that I do need it :(
+
+zinb_mod_5b <- glmmTMB(
+  Egg.Number ~ Host.Species + Parasite+ Host.Species * Parasite +(1|Lake.Name)+(1|month), 
+  family=poisson,
+  data = coke_filt
+)
+sim_res_5b <- simulateResiduals(zinb_mod_5b)
+plot(sim_res_5b) #same results as sim_res_5 (above)
+testDispersion(sim_res_5b) #non-significant
+testZeroInflation(sim_res_5b) #ns
+
+#6- Standard GLM with negative binomial or poisson distribution on data transformed by adding 1 to all Egg Counts 
+#transform data first 
+coke_filt$egg_transformed <-coke_filt$Egg.Number+1
+
+#model
+zinb_mod_6 <- glmmTMB(
+  egg_transformed ~ Host.Species+Parasite+Host.Species * Parasite +(1|month), 
+  family=nbinom2,
+  data = coke_filt
+)
+
+#negative binomial did not converge following conversion? Poisson did? Upon looking into it, it seems like a Negbinomial model with absolutely no zeroes (as with the transformed data), might require Zero-Truncated modelling. I don't know
+
+#try transformed data with poisson distribution
+
+zinb_mod_6b <- glmmTMB(
+  egg_transformed ~ Host.Species + Parasite + Host.Species * Parasite +(1|Lake.Name)+(1|month), 
+  family=poisson,
+  data = coke_filt
+)
+#test model
+sim_res_6b <- simulateResiduals(zinb_mod_6b)
+plot(sim_res_6b) #everything is bad no good
+testDispersion(sim_res_6b) #significant!
+testZeroInflation(sim_res_6b) #significant! Even though there's no zeroes now?? HOW are we zero-inflated?
+
+
+#compare AICs
+AIC(zinb_mod_1b)
+AIC(zinb_mod_2)
+AIC(zinb_mod_3)
+AIC(zinb_mod_5)
+AIC(zinb_mod_5b)
+AIC(zinb_mod_6b)
+#model 5 is the best fit?? Somehow? So the ZINB isn't the move? But it is!! Isn't it?!?!? 
+
+
+# View results
+summary(zinb_mod_5)
+
+# Model coefficients
+coef(zinb_mod_5)
+
+# Predicted values
+predictions <- predict(zinb_mod_5, type = "response")
+predictions
+
+
+```
