@@ -1,0 +1,1691 @@
+---
+title: "Eggratio_figures_2026"
+output: html_document
+date: "2026-03-25"
+---
+
+This document is forall descriptive statistics and figure code for egg ratio.
+
+This markdown includes analyses for 2022 egg ratio field data. I am using data which was cleaned using "Cleaningcode_eggratios_2026.Rmd". 
+
+The first part of this code is copied in "Eggratio_analyses_26.Rmd". That document contains all the stats run for this project.
+```{r, load_libraries}
+#libraries
+library(ggplot2)
+library(dplyr)
+library(emmeans)
+library(glmmTMB)
+library(remotes)
+library(DHARMa)
+library(ggpubr)
+library(tidyr)
+library(pscl)
+library(boot)
+library(MASS)
+library(car)
+library(gridExtra)
+library(stringr)
+library(cowplot)
+library(ggpubr)
+#install.packages("boot")
+#install.packages("Matrix", version="1.6-2")
+#install.packages("DHARMa")
+#install.packages("remotes")
+#install.packages("ggpubr")
+#install.packages("pscl")
+```
+
+```{r, data_read}
+#cleaned egg count data
+all_data <- read.csv(file="Data/cleaned_eggcounts_includesephippial_1_29_26_TAS.csv", header=T)
+head(all_data)
+```
+
+Remove ephippia & observations past sexual selection for cerio & dentifera
+```{r, ephippia_and_ephippiadates}
+#Epphipia are included in these data. Since we are doing a comparison of egg counts, we won't be using those observations. However, since the start of sexual reproduction might also skew the frequency of eggs in general, I am going to remove all observations after the onset of sexual reproduction for dentifera & cerio in the fall. 
+
+#Prior to removing all ephippia, use theme to determine the likely onset of sexual reproduction in the populations. 
+dent <- all_data[all_data$Host.Species=="Dentifera"&all_data$Egg.Number=="e",]
+cerio <- all_data[all_data$Host.Species=="Cerio"&all_data$Egg.Number=="e",]
+
+#identify all unique julian dates for ephippial dent and cerio
+unique(dent$julian)
+unique(cerio$julian)
+#identified the dates that sexual reproduction started: 285 for both cerio and dentifera
+#note: there is an single ephippia at day 158 in dentifera, but I am not going to treat that as the start date
+
+#filter out these dates
+df <- all_data[!(all_data$Host.Species %in% c("Dentifera", "Cerio") & all_data$julian >= 285), ]
+  #filtering in this way removes 1528 observations
+
+#now to remove remaining ephippia. 
+#create a logical vector for which all non-ephippial individuals are given a 1
+LV_noepphipial <- df$Egg.Number!="e"
+sum(LV_noepphipial) #sum is 14861, meaning there are 61 ephippia observations to remove
+
+df <-df[LV_noepphipial,] 
+#new data frame has 14861 observations, which matches the removal of 61 observations (the remaining ephippial animals)
+
+#double check Egg Number column to ensure that all ephippia have been removed
+class(df$Egg.Number)
+unique(df$Egg.Number)
+
+#reclassify as numeric
+df$Egg.Number<- as.numeric(df$Egg.Number)
+
+#make sure julian is a factor, not an integer
+df$julian <- as.numeric(df$julian)
+
+#check that we didn't filter ALL the large dates out
+unique(df$julian)
+
+
+#check dates for manuscript reasons
+#unique(df$Date.Sampled)
+```
+
+Now I'll filter out the rare parasites.
+
+```{r, filter_rare_parasites}
+#figure out which parasites we won't be looking at
+table(df$Parasite)
+#output: 
+#Brood  Caullerya       Coke    Gurleya  Larssonia     Metsch       MicG       Past     Spider      Spiro Uninfected 
+ #       57         30       2030         10          4         12       1050        337          1        152      11178 
+#get rid of Caullerya, gurleya, larssonia, metsch, spider
+
+#filter out the parasites of lowest density
+df_filtered <- df[df$Parasite=="Brood"|df$Parasite=="Past"|df$Parasite=="Coke"|df$Parasite=="MicG"|df$Parasite=="Uninfected",]
+
+#check that filtering worked
+unique(df_filtered$Parasite)
+
+#add in a month column so that models can be simplified later on
+#set date column to date class
+df_filtered$Date.Sampled <- as.Date(df_filtered$Date.Sampled)
+
+#extract month
+df_filtered$month <- format(df_filtered$Date.Sampled, "%m")
+unique(df_filtered$month)
+```
+
+"df_filtered" contain all data from observations of uninfected animals as well as 5 parasites which had more than 50 observations over the course of the 2022 field season.
+Create separate dataframes for each of the parasites. Eventually, I will join together the uninfected data with data for each of the parasites, subsetting the uninfected so that only data from dates and lakes where the parasite was found are kept. 
+
+```{r, subset_data}
+#first, split out the original data frame by parasite
+brood_only <- df_filtered[df_filtered$Parasite=="Brood",]
+past_only <- df_filtered[df_filtered$Parasite=="Past",]
+micg_only <-df_filtered[df_filtered$Parasite=="MicG",]
+coke_only <- df_filtered[df_filtered$Parasite=="Coke",]
+uninf_only <- df_filtered[df_filtered$Parasite=="Uninfected",]
+```
+
+Now I need to try properly subsetting the data so that the uninfected animals I'm comparing to infected are ONLY from the lakes, dates and hosts where the infected were found. This is trickier than it seems because if we subset using only logical vectors,then we run into the problem where hosts where infections were not found but were in lakes on a date where brood was found in a different host will still be hanging around. 
+Start with brood since it has the least observations 
+
+DISCLAIMER JAN 2026: I know this is not necessarily the most efficient way to subset in this way! A lot of this cleaning code was done before I became more familiar with dplyr and other data cleaning packages. 
+
+```{r, data_wrangling_brood_test}
+
+#merge brood and uninfected
+brood_test <- rbind(brood_only, uninf_only) #currently contains all the uninfected & brood observations
+
+#concatenate host species, lake & date 
+brood_test$specieslakeday <- paste(brood_test$Host.Species,brood_test$Lake.Name,brood_test$julian)
+
+#now we just need to match specieslakedates of the infected animals with the same for uninfected
+#subset data by whether or not animal is infected
+Ybrood <- dplyr::filter(brood_test, Parasite=="Brood")
+Nbrood <- dplyr::filter(brood_test, Parasite=="Uninfected")
+
+#look in negative dataset to see if the specieslakeday is in the positive data set
+# if it is, test variable will be yes
+Nbrood$test <-  ifelse(Nbrood$specieslakeday %in% Ybrood$specieslakeday, "yes", "no")
+
+#create the test variable in the data set with all infected animals
+Ybrood$test <- "yes"
+
+#recombine data sets so it's brood and uninfected animals
+recombinedbrood <- rbind (Ybrood, Nbrood)
+
+#subset data by the test variable being yes
+brood_proper <- dplyr::filter(recombinedbrood, test=="yes") #final data set has 851 observations
+```
+Repeat the above with three other parasites (past, micg, sprite)
+
+```{r, subsetting_properly}
+################################################################################################
+####MICG######
+#merge micg and uninfected
+micg_test <- rbind(micg_only, uninf_only) #currently contains all the uninfected & micg observations
+
+#concatenate host species, lake & date 
+micg_test$specieslakeday <- paste(micg_test$Host.Species,micg_test$Lake.Name,micg_test$julian)
+
+#now we just need to match specieslakedates of the infected animals with the same for uninfected
+#subset data by whether or not animal is infected
+Ymicg <- dplyr::filter(micg_test, Parasite=="MicG")
+Nmicg <- dplyr::filter(micg_test, Parasite=="Uninfected")
+
+#look in negative dataset to see if the specieslakeday is in the positive data set
+# if it is, test variable will be yes
+Nmicg$test <-  ifelse(Nmicg$specieslakeday %in% Ymicg$specieslakeday, "yes", "no")
+
+#create the test variable in the data set with all infected animals
+Ymicg$test <- "yes"
+
+#recombine data sets so it's micg and uninfected animals
+recombinedmicg <- rbind (Ymicg, Nmicg)
+
+#subset data by the test variable being yes
+micg_proper <- dplyr::filter(recombinedmicg, test=="yes") #final data set has 4041 observations
+
+##########################################################################################
+######Sprite
+#merge coke and uninfected
+coke_test <- rbind(coke_only, uninf_only) #currently contains all the uninfected & coke observations
+
+#concatenate host species, lake & date 
+coke_test$specieslakeday <- paste(coke_test$Host.Species,coke_test$Lake.Name,coke_test$julian)
+
+#now we just need to match specieslakedates of the infected animals with the same for uninfected
+#subset data by whether or not animal is infected
+Ycoke <- dplyr::filter(coke_test, Parasite=="Coke")
+Ncoke <- dplyr::filter(coke_test, Parasite=="Uninfected")
+
+#look in negative dataset to see if the specieslakeday is in the positive data set
+# if it is, test variable will be yes
+Ncoke$test <-  ifelse(Ncoke$specieslakeday %in% Ycoke$specieslakeday, "yes", "no")
+
+#create the test variable in the data set with all infected animals
+Ycoke$test <- "yes"
+
+#recombine data sets so it's coke and uninfected animals
+recombinedcoke <- rbind (Ycoke, Ncoke)
+
+#subset data by the test variable being yes
+coke_proper <- dplyr::filter(recombinedcoke, test=="yes") #final data set has 7067 observations
+
+##########################################################################################
+######Past
+#merge past and uninfected
+past_test <- rbind(past_only, uninf_only) #currently contains all the uninfected & past observations
+
+#concatenate host species, lake & date 
+past_test$specieslakeday <- paste(past_test$Host.Species,past_test$Lake.Name,past_test$julian)
+
+#now we just need to match specieslakedates of the infected animals with the same for uninfected
+#subset data by whether or not animal is infected
+Ypast <- dplyr::filter(past_test, Parasite=="Past")
+Npast <- dplyr::filter(past_test, Parasite=="Uninfected")
+
+#look in negative dataset to see if the specieslakeday is in the positive data set
+# if it is, test variable will be yes
+Npast$test <-  ifelse(Npast$specieslakeday %in% Ypast$specieslakeday, "yes", "no")
+
+#create the test variable in the data set with all infected animals
+Ypast$test <- "yes"
+
+#recombine data sets so it's past and uninfected animals
+recombinedpast <- rbind (Ypast, Npast)
+
+#subset data by the test variable being yes
+past_proper <- dplyr::filter(recombinedpast, test=="yes") #final data set has 2084 observations
+```
+
+```{r, rename_datasets}
+brood <-brood_proper
+past <- past_proper
+micg <- micg_proper
+coke <- coke_proper
+```
+
+___________________________________________________________
+___________________________________________________________
+____________Figure 1 Code (uninf egg counts)_______________
+___________________________________________________________
+___________________________________________________________
+
+Code for figure 1; looking at uninfected egg counts only. 
+
+show egg number for uninfected animals using a heat map, as well as a plot showing only one host species
+
+```{r}
+#make a heatmap to show median/mean egg counts by lake, month and host species. 
+
+egg_summary <- uninf_only %>%
+  dplyr::group_by(month, Lake.Name, Host.Species) %>%
+  dplyr::summarise(
+    mean_egg_number   = mean(Egg.Number, na.rm = TRUE),
+    median_egg_number = median(Egg.Number, na.rm = TRUE),
+    n = sum(!is.na(Egg.Number)),
+    .groups = "drop"
+  )
+
+egg_summary
+
+#reorder months and change to month name
+library(plyr)
+egg_summary$month <- revalue(egg_summary$month, c("06" = "Jun", "07" = "Jul", "08"="Aug","09"="Sep","10"="Oct","11"="Nov"))
+levels(egg_summary$month) <- c("Nov","Oct","Sep","Aug","Jul","Jun")
+
+
+#rename host species for plot
+unique(egg_summary$Host.Species)
+egg_summary$Host.Species <- revalue(egg_summary$Host.Species, c("Cerio" = "Ceriodaphnia spp.", "Ambigua" = "D. ambigua", "Dentifera"="D. dentifera",
+                                                                "Dubia"="D. dubia", "Mendotae"="D. mendotae", "Parvula"="D. parvula",
+                                                                "Pulicaria"="D. pulicaria", "Retrocurva"="D. retrocurva"))
+
+#rename lakes to shorten everything
+egg_summary$Lake.Name <- revalue(egg_summary$Lake.Name, c("Appleton" = "A", "Bishop" = "B", "Bruin"="Br", "Cedar"="C", "Crooked_P"="CP",
+                                                                "Crooked_W"="CW", "Gosling"="G", "Little_Appleton"="LA", "Mill"="M",
+                                                                "North"="N", "Pickerel"="P","Sullivan"="S","Walsh"="W","Whitmore"="Wh", "Woodland"="Wo"))
+
+
+#filter out any mean with an n of less than 5 
+egg_summary_filt <- egg_summary[egg_summary$n>=5,]
+  
+#heatmap with mean eggs
+heatmap_mean <- ggplot(egg_summary_filt, aes(x = Lake.Name, y = month, fill = mean_egg_number)) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  facet_wrap(~ Host.Species, ncol=2) +
+  scale_fill_viridis_c(name = "Avg. uninfected\negg count") +
+  labs(x = "Lake", y = "Month") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  ) +
+  theme(legend.position = "bottom") +
+  guides(color = guide_colorbar(direction = "horizontal", title.position = "left"))
+
+heatmap_mean
+
+
+#make another plot with only dentifera, and lines for each lakes 
+dent_uninf <- uninf_only[uninf_only$Host.Species=="Dentifera",]
+dent_sum <-  dent_uninf %>%
+  dplyr::group_by(month, Lake.Name) %>%
+  dplyr::summarise(
+    mean_egg_number   = mean(Egg.Number, na.rm = TRUE),
+    median_egg_number = median(Egg.Number, na.rm = TRUE),
+    n = sum(!is.na(Egg.Number)),
+    .groups = "drop"
+  )
+
+#reorder values
+dent_sum$month <- revalue(dent_sum$month, c("06" = "Jun", "07" = "Jul", "08"="Aug","09"="Sep","10"="Oct"))
+
+dent_sum <- dent_sum %>%
+  mutate(month = factor(month, levels = c("Jun","Jul","Aug","Sep","Oct")))
+
+
+#rename lakes to shorten everything
+dent_sum$Lake.Name <- revalue(dent_sum$Lake.Name, c("Appleton" = "A", "Bishop" = "B", "Bruin"="Br", "Cedar"="C", "Crooked_P"="CP",
+                                                                "Crooked_W"="CW", "Gosling"="G", "Little_Appleton"="LA", "Mill"="M",
+                                                                "North"="N", "Pickerel"="P","Sullivan"="S","Walsh"="W","Whitmore"="Wh", "Woodland"="Wo"))
+
+#filter out any host-lake-months with less than 5 observations
+dent_sum_filt <- dent_sum[dent_sum$n>=5,]
+
+#plot 
+
+#first create a unique palette for the 15 lakes. This is also the palette used for figure 2
+#this color palette is based on a "dutch field" palette I found online
+colors_lakes <- c("Appleton"="#e60049","Bishop"="#0bb4ff","Bruin"="#50e991",
+                  "Cedar"="#e6d800", "Crooked_P"="#9b19f5", "Crooked_W"="#ffa300",
+                  "Gosling"="#dc0ab4","Little_Appleton"="#b3d4ff","Mill"="#00bfa0",
+                  "North"="#ff6168","Pickerel"="#7d5cff","Sullivan"="#ff34b3",
+                  "Walsh"="#f4a582","Whitmore"="#6a3d9a", "Woodland"="#2ec27e")
+
+#copy color palette for abbreviations of lakes
+colors_lakes_abbrevs <- c("A"="#e60049","B"="#0bb4ff","Br"="#50e991",
+                  "C"="#e6d800", "CP"="#9b19f5", "CW"="#ffa300",
+                  "G"="#dc0ab4","LA"="#b3d4ff","M"="#00bfa0",
+                  "N"="#ff6168","P"="#7d5cff","S"="#ff34b3",
+                  "W"="#f4a582","Wh"="#6a3d9a", "Wo"="#2ec27e")
+
+
+#plot
+dent_plot <- ggplot(dent_sum, aes(x = month, y = mean_egg_number, color = Lake.Name, group = Lake.Name)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = colors_lakes) +
+  labs(x = "", y = "Avg. uninfected egg count", color = "Lake") +
+  theme_bw()+
+  theme(legend.position = "none")
+dent_plot
+
+
+
+#fix factoring problems with months so that lines meet the edges of the plots 
+
+dent_sum <- dent_sum %>%
+  mutate(month_num = match(month, c("Jun","Jul","Aug","Sep","Oct")) + 5)
+
+dent_plot <- ggplot(dent_sum_filt, aes(x = month, y = mean_egg_number, color = Lake.Name, group = Lake.Name)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = colors_lakes_abbrevs) +
+  scale_x_discrete(expand = c(0, 0.03)) +   # remove gaps at ends of discrete x axis
+  labs(x = "", y = "Avg. uninfected egg count", color = "Lake") +
+  theme_bw() +
+  facet_wrap(~"D. dentifera") +
+  theme(legend.position = "bottom") +
+  guides(color = guide_legend(direction = "horizontal", title.position = "left"))
+
+dent_plot
+
+library(cowplot)
+#arrange both plots
+#first, extract legend from both plots
+legs_heat <- cowplot::get_legend(heatmap_mean)
+legs_dent <- cowplot::get_legend(dent_plot)
+
+#remove legends from the main plots
+p_dent_noleg <- dent_plot + theme(legend.position = "none")
+p_heat_noleg  <- heatmap_mean  + theme(legend.position = "none")
+
+
+#arrange the main plots with labels and have the top panel take up only 1/4
+
+test_fig1 <- ggarrange(
+  p_dent_noleg, p_heat_noleg,
+  ncol = 1, nrow = 2,
+  heights = c(1, 3),
+  labels = "AUTO",
+  label.x = 0.04  
+)
+test_fig1
+
+#combine legends
+legends <- plot_grid(legs_dent, legs_heat, ncol=2)
+
+
+final <- plot_grid(test_fig1, legends, ncol = 1, rel_heights = c(1, 0.1))
+final
+
+#save plot
+ggsave(
+  filename = "test_fig6.jpg",
+  plot     = final,
+  width    = 6,
+  height   = 10,
+  units    = "in",
+  dpi      = 300
+)
+```
+
+Now to calculate some descriptive statistics for this section: "life is hard"
+
+```{r}
+#calculate number of host-lake-months had a avg of 0 or 1
+#egg summary filtered is the data frame I want
+head(egg_summary)
+table(egg_summary$n)
+
+###looking at egg_summary filtered 
+LV_lowegg <- egg_summary_filt$mean_egg_number <1
+sum(LV_lowegg) #151
+
+#151 out of 290 observations has an average of less than 1
+LV_lowegg2 <- egg_summary_filt$mean_egg_number <2
+sum(LV_lowegg2) #270
+#removing 151 obs below zero (above), 119 between 1-2
+
+151/290
+119/290
+
+```
+
+
+___________________________________________________________
+___________________________________________________________
+____________Figure 2 Code (averaged differences)__________
+___________________________________________________________
+___________________________________________________________
+
+####################SPRITE################################
+The first plot I am going to make for each parasite is one which shows the differences without dividing by clutch presence/absence. 
+
+This plot will show the overall average of the difference between infected animals egg counts and the average uninfected egg count for the corresponding specieslakeday. Individual differences will also be shown on the same plot. 
+
+```{r, calculate_differences_sprite}
+#separate out uninfected animals that are specific to micg data set 
+coke_uninf <- coke[coke$Parasite=="Uninfected",]
+
+#for later on, create a column for clutch presence/absence
+#create new column for clutch presence absence using dplyr
+coke$clutchyn <- ifelse(coke$Egg.Number>0,1,0)
+
+#calculate means for uninfected animals
+mean_coke_uninf <- coke_uninf %>%  dplyr::group_by(Host.Species, Lake.Name, julian) %>% 
+   dplyr::summarise(mean_egg_uninf=mean(Egg.Number), sd_uninf=sd(Egg.Number), n_uninf = n(),
+    se_uninf = sd_uninf / sqrt(n_uninf))
+mean_coke_uninf
+
+#join this averaged data to the infected animals, then calculate a difference for individual animals
+coke_differences_all <- coke %>%
+  filter(Parasite == 'Coke') %>%
+  left_join(mean_coke_uninf, by = c('Host.Species', 'Lake.Name', 'julian')) %>%
+  mutate(Difference = Egg.Number - mean_egg_uninf)
+
+#remove observations from dates where the number of uninfected animals was less <5. 
+coke_differences <- coke_differences_all %>%
+  filter(n_uninf >= 5)
+#new data set has 2057 rows, meaning we removed 7 observations using this filtering ste
+
+#ok now we have a column which shows the difference between each infected individual's egg count and the average uninfected egg count for the specieslakeday corresponding to that infected animal. Now we should just have to take the average of that column by host species and plot? 
+mean_coke_all<- coke_differences %>%  dplyr::group_by(Host.Species) %>% 
+   dplyr::summarise(mean_diff=mean(Difference), sd_diff=sd(Difference), n_diff = n(),
+    se_diff = sd_diff / sqrt(n_diff))
+mean_coke_all
+
+#filter out any host species which had less than 5 observations of infected animals
+mean_coke_diffs <- mean_coke_all %>% filter(n_diff>=5)
+
+#Create a new table of all differences without cerio or mendotae
+all_coke_diffs_filt <- coke_differences %>%
+    filter(!Host.Species %in% c("Cerio", "Mendotae"))
+
+#create a dataframe from the filtered differences above) which averages by specieslakeday rather than just host species. This is to simplify the representation of the data in the final figure, since there are over 1000 data points in some cases
+mean_ind_differences<- all_coke_diffs_filt %>%  dplyr::group_by(Host.Species, Lake.Name, julian) %>% 
+   dplyr::summarise(mean_sld=mean(Difference), sd_sld=sd(Difference), n_sld = n(),
+    se_sld = sd_sld / sqrt(n_sld))
+mean_ind_differences
+
+#ok, now we have a summary data frame which has the totaled average of the difference between individual infected egg counts and uninfected average egg counts for that day. 
+#on top of the plot of this average, I am going to plot each individual difference color coded by lake and shaded by julian day
+pd <- position_dodge(0.5)
+
+coke_diff_fig <-ggplot(mean_coke_diffs, aes(x=Host.Species, y=mean_diff)) + 
+    geom_jitter(data = mean_ind_differences, aes(x = Host.Species, y = mean_sld,     color=Lake.Name, size=n_sld),
+    position = position_jitter(width = 0.2)) +
+  scale_color_manual(values = colors_lakes, name="Lake Name")+
+  #scale_alpha_continuous(range=c(0.3,0.85), name="Julian Day")+
+  scale_size_continuous(range=c(1,5), limits=c(1,140), breaks=c(10,25,50,100,125), name="Number Infected Animals")+
+  geom_errorbar(aes(ymin=mean_diff-se_diff, ymax=mean_diff+se_diff), width=.2, size=0.5, position=pd, color="black") +
+    geom_point(position=pd, size=3, color="black", shape=18)+
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    labs(title="All Animals")+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+    legend.position = "none", #legend.text=element_text(size=22),
+    axis.text.x=element_text(size=7, color="black", angle = 25, vjust = 1, hjust=1), 
+    axis.text.y=element_text(size=7, color="black"),
+    axis.title=element_text(size=8,face="bold"),
+    plot.title = element_text(hjust=1, vjust = 1, size=7))+
+    #legend.key=element_rect(fill="white"))+
+    #guides(color = guide_legend(title = ""))+
+    ylab("Pan. perplexa Inf-Uninf Egg Count")+
+    xlab("")+
+    ylim(-3,3)+
+    scale_x_discrete(labels=c("D. ambigua", "D. dentifera", "D. dubia", "D. parvula", "D. pulicaria", "D. retrocurva"))
+    #annotate(geom="text", x=1, y=1.75, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=2, y=1.75, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=3, y=2.5, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=4, y=2.5, label=c(""), color="black", size=15)+
+    #annotate(geom="text", x=5, y=1.75, label=c("**"), color="black", size=15)
+coke_diff_fig
+
+
+#some changes need to be made for the summary figure plot (which is just the overall plot)
+coke_diff_sum_fig <- coke_diff_fig +
+                            labs(title="Pan. perplexa")+
+                            theme(plot.title=element_text(hjust=0.5, vjust=1, size=7))
+coke_diff_sum_fig
+
+
+```
+
+First, create a new column for clutch presence/absence
+
+```{r, clutch_presence_coke}
+#create new column for clutch presence absence using dplyr
+#coke$clutchyn <- ifelse(coke$Egg.Number>0,1,0) #this was added in in code above
+
+#now, I need to create a summary dataset that indicates the number of individuals unique to each specieslakedate as well as the proportion of each infecstatusspecieslakedate that had eggs 
+#pivot wider so that each specieslakeday has one row rather than one for each infection status
+
+coke_clutch_presence <- coke %>%
+  group_by(Parasite, specieslakeday) %>%
+  dplyr::summarise(
+    proportion = mean(clutchyn),
+    count =n(),
+    .groups="drop"
+  ) %>%
+  pivot_wider(
+    names_from = Parasite,
+    values_from = c(proportion,count)
+  )
+
+
+#remove any row where the count for either infected or uninfect was less than 5
+coke_clutch_presence_filt <- coke_clutch_presence %>%
+  filter(count_Coke>=4,count_Uninfected>=4)
+
+#ok, now we need to create the difference between proportion of animals with a clutch for uninfected-infected
+coke_clutch_presence_filt$diff <- coke_clutch_presence_filt$proportion_Coke-coke_clutch_presence_filt$proportion_Uninfected
+
+
+#now in order to take the mean of these differences by host I need to separate out hosts again
+coke_clutch_presence_filt <- coke_clutch_presence_filt %>%
+ mutate(hostspecies = word(specieslakeday, 1),
+         lake=word(specieslakeday,2),
+         julian=word(specieslakeday,3)
+  )
+
+#change class of julian after extraction from specieslakeday
+coke_clutch_presence_filt$julian <- as.numeric(coke_clutch_presence_filt$julian)
+
+#create yet another summary table where the mean of the calculated difference in proportions is taken
+sum_coke_clutchyn <- coke_clutch_presence_filt %>%
+  group_by(hostspecies) %>%
+  dplyr::summarise(
+    n=dplyr::n(),
+    mean_diff=mean(diff, na.rm=TRUE),
+    sd_diff=sd(diff,na.rm=TRUE),
+    se_diff=sd_diff/sqrt(n)
+  )
+
+#ok, now I want to graph the mean differences out for coke
+coke_clutch_presence_plot <- ggplot(sum_coke_clutchyn, aes(x = hostspecies, y = mean_diff)) +
+  geom_jitter(
+    data = coke_clutch_presence_filt, 
+    aes(x = hostspecies, y = diff, color = lake), 
+    position = position_jitter(width = 0.2), 
+    size = 2
+  ) +
+   geom_point(size = 3, color = "black", shape = 18) +  # Add points for mean differences
+  geom_errorbar(
+    aes(ymin = mean_diff - se_diff, ymax = mean_diff + se_diff), 
+    width = .2, size = 0.5, color = "black"
+  ) +
+  scale_color_manual(values = colors_lakes, name = "lake") +
+  #scale_alpha_continuous(range = c(0.3, 0.85)) +
+  #scale_size_continuous(range = c(0.5, 5), limits=c(10,140), breaks=c(10,25,50,100,125)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  
+  labs(title="Clutch Presence") +
+   theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+    legend.position = "none", #legend.text=element_text(size=22),
+    axis.text.x=element_text(size=7, color="black", angle = 25, vjust = 1, hjust=1), 
+    axis.text.y=element_text(size=7, color="black"),
+    axis.title=element_text(size=8,face="bold"),
+    plot.title=element_text(hjust=1, vjust=1, size=7))+
+    #legend.key=element_rect(fill="white"))+
+    #guides(color = guide_legend(title = ""))+
+    ylab("Inf-Uninf Proportion with Clutch")+
+    xlab("")+
+    ylim(-0.8,0.8)+
+    scale_x_discrete(labels=c("D. ambigua", "D. dentifera", "D. dubia", "D. parvula", "D. pulicaria", "D. retrocurva"))
+
+coke_clutch_presence_plot
+
+```
+
+Ok, we have calculated the mean change in proportion of animals that have clutches, now we need to look at differences in clutch size (so compare the number of eggs in uninfected animals that DO have one or more egg to the number of infected, etc)
+
+For the first plot (with all points included) we took the total average of differences between individual infected animals and the mean of the uninfected egg count on the same corresponding day. We can do the same for clutch size using the same data set by simply filtering out any animals which have a clutch size of 0, then applying the same code. That's what I'm going to work on below. 
+
+
+```{r, clutch_size_coke}
+#create a dataset using the clutchyn column which only has the animals that DID have clutches
+#the code below is to create this data set using the data where differences between infected and the uninfected average have already been calculated. I am taking this code out because the overall mean is biased to show difference between only animals which had a clutch and the TOTAL uninfected average (including zeroes). This should be adjusted so it's the difference between infected WITH clutch and uninfected WITH clutch
+
+######REMOVED CODE#######
+#coke_clutch_size_all <- coke_differences[coke_differences$clutchyn==1,]
+#ok, now we have a dataframe that already has the differences between individual infected animals and the uninfected average for that day (with any day of less than 5 uninfected filtered out). Now it is time to calculate the individual means for specific specieslakedays as well as the overall average difference as we did with the main plot
+#create a summary data set with the mean number of eggs by infection status and specieslakeday
+#coke_clutch_size_mean_diff <- coke_clutch_size_all %>%
+#  group_by(Host.Species) %>%
+#  summarise(
+#    mean_diff= mean(Difference),
+#    sd_diff=sd(Difference),
+#     count = n(),
+#    se_diff=sd_diff/sqrt(count),
+#    .groups="drop"
+#  )
+
+#now we have the averages of differences for clutch sizes >=1, we need to calculate the individual differences for lakespeciesday as we did before for the plots 
+#coke_clutch_size_ind_differences<- coke_clutch_size_all %>%  dplyr::group_by(Host.Species, Lake.Name, julian) %>% 
+#   dplyr::summarise(mean_sld=mean(Difference), sd_sld=sd(Difference), n_sld = n(),
+#    se_sld = sd_sld / sqrt(n_sld))
+#coke_clutch_size_ind_differences
+###################################
+#Create a data frame with only animals (infected & uninfected) that have clutches
+coke_clutch_size_all <- coke[coke$clutchyn==1,]
+
+#separate out uninfected animals that are specific to micg data set 
+coke_uninf_wclutch <- coke_clutch_size_all[coke_clutch_size_all$Parasite=="Uninfected",]
+
+#calculate means for uninfected animals
+mean_coke_uninf_wclutch <- coke_uninf_wclutch %>%  dplyr::group_by(Host.Species, Lake.Name, julian) %>% 
+   dplyr::summarise(mean_egg_uninf=mean(Egg.Number), sd_uninf=sd(Egg.Number), n_uninf = n(),
+    se_uninf = sd_uninf / sqrt(n_uninf))
+mean_coke_uninf_wclutch
+
+#join this averaged data to the infected animals, then calculate a difference for individual animals
+coke_wclutch_differences_all <- coke_clutch_size_all %>%
+  filter(Parasite == 'Coke') %>%
+  left_join(mean_coke_uninf_wclutch, by = c('Host.Species', 'Lake.Name', 'julian')) %>%
+  mutate(Difference = Egg.Number - mean_egg_uninf)
+
+#remove observations from dates where the number of uninfected animals was less <5. 
+coke_wclutch_differences <- coke_wclutch_differences_all %>%
+  filter(n_uninf >= 5)
+
+#ok now we have a column which shows the difference between each infected individual's egg count and the average uninfected egg count for the specieslakeday corresponding to that infected animal. Now we should just have to take the average of that column by host species and plot? 
+mean_coke_wclutch_all<- coke_wclutch_differences %>%  dplyr::group_by(Host.Species) %>% 
+   dplyr::summarise(mean_diff=mean(Difference), sd_diff=sd(Difference), n_diff = n(),
+    se_diff = sd_diff / sqrt(n_diff))
+mean_coke_wclutch_all
+
+#filter out any host species which had less than 5 observations of infected animals
+mean_coke_wclutch_diffs <- mean_coke_wclutch_all %>% filter(n_diff>=5)
+
+#now we need the individual differences 
+coke_clutch_size_ind_differences<- coke_wclutch_differences %>%  dplyr::group_by(Host.Species, Lake.Name, julian) %>% 
+   dplyr::summarise(mean_sld=mean(Difference), sd_sld=sd(Difference), n_sld = n(),
+    se_sld = sd_sld / sqrt(n_sld))
+coke_clutch_size_ind_differences
+
+
+#ok, now we have a data frame with the overall means as well as the individual means, so now it is time to make the same plot as the overall difference plot
+pd <- position_dodge(0.5)
+
+coke_clutchsize_fig <-ggplot(mean_coke_wclutch_diffs, aes(x=Host.Species, y=mean_diff)) + 
+    geom_jitter(data = coke_clutch_size_ind_differences, aes(x = Host.Species, y = mean_sld,     color=Lake.Name, size=n_sld),
+    position = position_jitter(width = 0.25)) +
+  scale_color_manual(values = colors_lakes, name="Lake Name")+
+  #scale_alpha_continuous(range=c(0.3,0.85))+
+  scale_size_continuous(range = c(1, 5), limits=c(1,140), breaks=c(10,25,50,100,125)) +
+  #scale_size_continuous(range=c(1,4))+
+  geom_errorbar(aes(ymin=mean_diff-se_diff, ymax=mean_diff+se_diff), width=.2, size=0.5, position=pd, color="black") +
+    geom_point(position=pd, size=3, color="black", shape=18)+
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    labs(title="Clutch Size >=1")+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+    legend.position = "none", #legend.text=element_text(size=22),
+    axis.text.x=element_text(size=7, color="black", angle = 25, vjust = 1, hjust=1), 
+    axis.text.y=element_text(size=7, color="black"),
+    axis.title=element_text(size=8, face="bold"),
+    plot.title = element_text(hjust=1, vjust=1, size=7))+
+    #legend.key=element_rect(fill="white"))+
+    #guides(color = guide_legend(title = ""))+
+    ylab("Pan. perplexa Inf-Uninf Egg Count")+
+    xlab("")+
+    ylim(-3,3)+
+    scale_x_discrete(labels=c("D. ambigua", "D. dentifera", "D. dubia", "D. parvula", "D. pulicaria", "D. retrocurva"))
+    #annotate(geom="text", x=1, y=1.75, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=2, y=1.75, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=3, y=2.5, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=4, y=2.5, label=c(""), color="black", size=15)+
+    #annotate(geom="text", x=5, y=1.75, label=c("**"), color="black", size=15)
+coke_clutchsize_fig
+
+```
+
+Now to arrange all of these figures
+```{r, coke_presense_size_plots}
+# Create a dummy blank plot for the legend space and format the legend so that it fits into the provided space. 
+legend <- get_legend(coke_diff_fig + theme(legend.position = "right", 
+                                           legend.text =element_text(size=7),
+                                           legend.title = element_text(size=8),
+                                           legend.spacing=unit(0.1,"cm"),
+                                           legend.key.size = unit(0.3, "cm"),
+                                           legend.margin = margin(0,0,0,0))+
+                       guides(color=guide_legend(order=1, ncol=3),
+                              size=guide_legend(order=2, nrow=1)
+                              ))
+#make the legend into a plot 
+legend_plot <- as_ggplot(legend)
+legend_plot
+
+ggarrange(coke_diff_fig, legend_plot,
+          coke_clutch_presence_plot, coke_clutchsize_fig,
+          ncol=2, nrow=2)
+
+```
+
+
+####################MICG################################
+Now to make the same figures for micg!! 
+
+```{r, calculate_differences_micg}
+#separate out uninfected animals that are specific to micg data set 
+micg_uninf <- micg[micg$Parasite=="Uninfected",]
+
+#for later on, create a column for clutch presence/absence
+#create new column for clutch presence absence using dplyr
+micg$clutchyn <- ifelse(micg$Egg.Number>0,1,0)
+
+#calculate means for uninfected animals
+mean_micg_uninf <- micg_uninf %>%  dplyr::group_by(Host.Species, Lake.Name, julian) %>% 
+   dplyr::summarise(mean_egg_uninf=mean(Egg.Number), sd_uninf=sd(Egg.Number), n_uninf = n(),
+    se_uninf = sd_uninf / sqrt(n_uninf))
+mean_micg_uninf
+
+#join this averaged data to the infected animals, then calculate a difference for individual animals
+micg_differences_all <- micg %>%
+  filter(Parasite == 'MicG') %>%
+  left_join(mean_micg_uninf, by = c('Host.Species', 'Lake.Name', 'julian')) %>%
+  mutate(Difference = Egg.Number - mean_egg_uninf)
+
+#remove observations from dates where the number of uninfected animals was less <5. 
+micg_differences <- micg_differences_all %>%
+  filter(n_uninf >= 5)
+#new data set has 2057 rows, meaning we removed 7 observations using this filtering ste
+
+#ok now we have a column which shows the difference between each infected individual's egg count and the average uninfected egg count for the specieslakeday corresponding to that infected animal. Now we should just have to take the average of that column by host species and plot? 
+mean_micg_all<- micg_differences %>%  dplyr::group_by(Host.Species) %>% 
+   dplyr::summarise(mean_diff=mean(Difference), sd_diff=sd(Difference), n_diff = n(),
+    se_diff = sd_diff / sqrt(n_diff))
+mean_micg_all
+
+#filter out any host species which had less than 5 observations of infected animals
+mean_micg_diffs <- mean_micg_all %>% filter(n_diff>=5)
+
+#Create a new table of all differences without parv or dubia
+all_micg_diffs_filt <- micg_differences %>%
+    filter(!Host.Species %in% c("Parvula", "Dubia"))
+
+#create a dataframe from the filtered differences above) which averages by specieslakeday rather than just host species. This is to simplify the representation of the data in the final figure, since there are over 1000 data points in some cases
+mean_ind_differences<- all_micg_diffs_filt %>%  dplyr::group_by(Host.Species, Lake.Name, julian) %>% 
+   dplyr::summarise(mean_sld=mean(Difference), sd_sld=sd(Difference), n_sld = n(),
+    se_sld = sd_sld / sqrt(n_sld))
+mean_ind_differences
+
+#now since this is the one we will eventually call for the summary legend, we need to rename lakes
+mean_ind_differences$Lake.Name <- revalue(mean_ind_differences$Lake.Name, c("Appleton" = "A", "Bishop" = "B", "Bruin"="Br", "Cedar"="C", "Crooked_P"="CP",
+                                                                "Crooked_W"="CW", "Gosling"="G", "Little_Appleton"="LA", "Mill"="M",
+                                                                "North"="N", "Pickerel"="P","Sullivan"="S","Walsh"="W","Whitmore"="Wh", "Woodland"="Wo"))
+
+#ok, now we have a summary data frame which has the totaled average of the difference between individual infected egg counts and uninfected average egg counts for that day. 
+#on top of the plot of this average, I am going to plot each individual difference color coded by lake and shaded by julian day
+pd <- position_dodge(0.5)
+
+micg_diff_fig <-ggplot(mean_micg_diffs, aes(x=Host.Species, y=mean_diff)) + 
+    geom_jitter(data = mean_ind_differences, aes(x = Host.Species, y = mean_sld,     color=Lake.Name,  size=n_sld),
+    position = position_jitter(width = 0.2)) +
+  scale_color_manual(values = colors_lakes_abbrevs, name="Lake Name")+
+  #scale_alpha_continuous(range=c(0.3,0.85), name="Julian Day")+
+  scale_size_continuous(range=c(1,5), limits=c(1,140), breaks=c(10,25,50,100,125), name="Number Infected Animals")+
+  geom_errorbar(aes(ymin=mean_diff-se_diff, ymax=mean_diff+se_diff), width=.2, size=0.5, position=pd, color="black") +
+    geom_point(position=pd, size=3, color="black", shape=18)+
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    labs(title="All Animals")+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+    legend.position = "none", #legend.text=element_text(size=22),
+    axis.text.x=element_text(size=7, color="black", angle = 25, vjust = 1, hjust=1), 
+    axis.text.y=element_text(size=7, color="black"),
+    axis.title=element_text(size=8,face="bold"),
+    plot.title = element_text(hjust=1, vjust = 1, size=7))+
+    #legend.key=element_rect(fill="white"))+
+    #guides(color = guide_legend(title = ""))+
+    ylab("O. pajunii Inf-Uninf Egg Count")+
+    xlab("")+
+    ylim(-3,3)+
+    scale_x_discrete(labels=c("C. dubia", "D. dentifera", "D. mendotae", "D. pulicaria", "D. retrocurva"))
+    #annotate(geom="text", x=1, y=1.75, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=2, y=1.75, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=3, y=2.5, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=4, y=2.5, label=c(""), color="black", size=15)+
+    #annotate(geom="text", x=5, y=1.75, label=c("**"), color="black", size=15)
+micg_diff_fig
+
+
+#some changes need to be made for the summary figure plot (which is just the overall plot)
+micg_diff_sum_fig <- micg_diff_fig +
+                            labs(title="O. pajunii")+
+                            theme(plot.title=element_text(hjust=0.5, vjust=1, size=7))
+micg_diff_sum_fig
+
+
+egg_summary$Lake.Name <- revalue(egg_summary$Lake.Name, c("Appleton" = "A", "Bishop" = "B", "Bruin"="Br", "Cedar"="C", "Crooked_P"="CP",
+                                                                "Crooked_W"="CW", "Gosling"="G", "Little_Appleton"="LA", "Mill"="M",
+                                                                "North"="N", "Pickerel"="P","Sullivan"="S","Walsh"="W","Whitmore"="Wh", "Woodland"="Wo"))
+
+```
+
+
+Next clutch presence figure
+```{r, clutch_presence_micg}
+#now, I need to create a summary dataset that indicates the number of individuals unique to each specieslakedate as well as the proportion of each infecstatusspecieslakedate that had eggs 
+#pivot wider so that each specieslakeday has one row rather than one for each infection status
+
+micg_clutch_presence <- micg %>%
+  group_by(Parasite, specieslakeday) %>%
+  dplyr::summarise(
+    proportion = mean(clutchyn),
+    count = n(),
+    .groups="drop"
+  ) %>%
+  pivot_wider(
+    names_from = Parasite,
+    values_from = c(proportion,count)
+  )
+
+
+#remove any row where the count for either infected or uninfect was less than 5
+micg_clutch_presence_filt <- micg_clutch_presence %>%
+  filter(count_MicG>=4,count_Uninfected>=4)
+
+#ok, now we need to create the difference between proportion of animals with a clutch for uninfected-infected
+micg_clutch_presence_filt$diff <- micg_clutch_presence_filt$proportion_MicG-micg_clutch_presence_filt$proportion_Uninfected
+
+#now in order to take the mean of these differences by host I need to separate out hosts again
+micg_clutch_presence_filt <- micg_clutch_presence_filt %>%
+  mutate(hostspecies = word(specieslakeday, 1),
+         lake=word(specieslakeday,2),
+         julian=word(specieslakeday,3)
+  )
+
+#change class of julian after extraction from specieslakeday
+micg_clutch_presence_filt$julian <- as.numeric(micg_clutch_presence_filt$julian)
+
+#create yet another summary table where the mean of the calculated difference in proportions is taken
+sum_micg_clutchyn <- micg_clutch_presence_filt %>%
+  group_by(hostspecies) %>%
+  dplyr::summarise(
+    n=n(),
+    mean_diff=mean(diff, na.rm=TRUE),
+    sd_diff=sd(diff,na.rm=TRUE),
+    se_diff=sd_diff/sqrt(n)
+  )
+
+#ok, now I want to graph the mean differences out for micg
+micg_clutch_presence_plot <- ggplot(sum_micg_clutchyn, aes(x = hostspecies, y = mean_diff)) +
+  geom_jitter(
+    data = micg_clutch_presence_filt, 
+    aes(x = hostspecies, y = diff, color = lake), 
+    position = position_jitter(width = 0.2), 
+    size = 2
+  ) +
+   geom_point(size = 3, color = "black", shape = 18) +  # Add points for mean differences
+  geom_errorbar(
+    aes(ymin = mean_diff - se_diff, ymax = mean_diff + se_diff), 
+    width = .2, size = 0.5, color = "black"
+  ) +
+  scale_color_manual(values = colors_lakes, name = "lake") +
+  #scale_alpha_continuous(range = c(0.3, 0.85)) +
+  scale_size_continuous(range = c(1, 4)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  
+  labs(title="Clutch Presence") +
+   theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+    legend.position = "none", #legend.text=element_text(size=22),
+    axis.text.x=element_text(size=7, color="black", angle = 25, vjust = 1, hjust=1), 
+    axis.text.y=element_text(size=7, color="black"),
+    axis.title=element_text(size=8,face="bold"),
+    plot.title=element_text(hjust=1, vjust=1, size=7))+
+    #legend.key=element_rect(fill="white"))+
+    #guides(color = guide_legend(title = ""))+
+    ylab("Inf-Uninf Proportion with Clutch")+
+    xlab("")+
+    ylim(-0.8,0.8)+
+    scale_x_discrete(labels=c("C. dubia", "D. dentifera", "D. mendotae", "D. pulicaria", "D. retrocurva"))
+
+micg_clutch_presence_plot
+
+```
+Now onto the clutch size plot for micg
+```{r, clutch_size_micg}
+#Create a data frame with only animals (infected & uninfected) that have clutches
+micg_clutch_size_all <- micg[micg$clutchyn==1,]
+
+#separate out uninfected animals that are specific to micg data set 
+micg_uninf_wclutch <- micg_clutch_size_all[micg_clutch_size_all$Parasite=="Uninfected",]
+
+#calculate means for uninfected animals
+mean_micg_uninf_wclutch <- micg_uninf_wclutch %>%  dplyr::group_by(Host.Species, Lake.Name, julian) %>% 
+   dplyr::summarise(mean_egg_uninf=mean(Egg.Number), sd_uninf=sd(Egg.Number), n_uninf = n(),
+    se_uninf = sd_uninf / sqrt(n_uninf))
+mean_micg_uninf_wclutch
+
+#join this averaged data to the infected animals, then calculate a difference for individual animals
+micg_wclutch_differences_all <- micg_clutch_size_all %>%
+  filter(Parasite == 'MicG') %>%
+  left_join(mean_micg_uninf_wclutch, by = c('Host.Species', 'Lake.Name', 'julian')) %>%
+  mutate(Difference = Egg.Number - mean_egg_uninf)
+
+#remove observations from dates where the number of uninfected animals was less <5. 
+micg_wclutch_differences <- micg_wclutch_differences_all %>%
+  filter(n_uninf >= 5)
+
+#ok now we have a column which shows the difference between each infected individual's egg count and the average uninfected egg count for the specieslakeday corresponding to that infected animal. Now we should just have to take the average of that column by host species and plot? 
+mean_micg_wclutch_all<- micg_wclutch_differences %>%  dplyr::group_by(Host.Species) %>% 
+   dplyr::summarise(mean_diff=mean(Difference), sd_diff=sd(Difference), n_diff = n(),
+    se_diff = sd_diff / sqrt(n_diff))
+mean_micg_wclutch_all
+
+#filter out any host species which had less than 4 observations of infected animals
+mean_micg_wclutch_diffs <- mean_micg_wclutch_all %>% filter(n_diff>=4)
+
+
+#now we need the individual differences 
+micg_clutch_size_ind_differences<- micg_wclutch_differences %>%  dplyr::group_by(Host.Species, Lake.Name, julian) %>% 
+   dplyr::summarise(mean_sld=mean(Difference), sd_sld=sd(Difference), n_sld = n(),
+    se_sld = sd_sld / sqrt(n_sld))
+micg_clutch_size_ind_differences
+
+#filter out hots 
+micg_clutch_size_ind_differences <- micg_clutch_size_ind_differences %>%
+    filter(!Host.Species %in% c("Parvula", "Dubia"))
+
+
+#ok, now we have a data frame with the overall means as well as the individual means, so now it is time to make the same plot as the overall difference plot
+pd <- position_dodge(0.5)
+
+micg_clutchsize_fig <-ggplot(mean_micg_wclutch_diffs, aes(x=Host.Species, y=mean_diff)) + 
+    geom_jitter(data = micg_clutch_size_ind_differences, aes(x = Host.Species, y = mean_sld,     color=Lake.Name, size=n_sld),
+    position = position_jitter(width = 0.25)) +
+  scale_color_manual(values = colors_lakes, name="Lake Name")+
+  #scale_alpha_continuous(range=c(0.3,0.85))+
+  #scale_size_continuous(range=c(1,4))+
+  scale_size_continuous(range=c(1,5), limits=c(1,140), breaks=c(10,25,50,100,125), name="Number Infected Animals")+
+  geom_errorbar(aes(ymin=mean_diff-se_diff, ymax=mean_diff+se_diff), width=.2, size=0.5, position=pd, color="black") +
+    geom_point(position=pd, size=3, color="black", shape=18)+
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    labs(title="Clutch Size >=1")+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+    legend.position = "none", #legend.text=element_text(size=22),
+    axis.text.x=element_text(size=7, color="black", angle = 25, vjust = 1, hjust=1), 
+    axis.text.y=element_text(size=7, color="black"),
+    axis.title=element_text(size=8, face="bold"),
+    plot.title = element_text(hjust=1, vjust=1, size=7))+
+    #legend.key=element_rect(fill="white"))+
+    #guides(color = guide_legend(title = ""))+
+    ylab("O. Pajunii Inf-Uninf Egg Count")+
+    xlab("")+
+    ylim(-3,3)+
+    scale_x_discrete(labels=c("C. dubia", "D. dentifera", "D. mendotae", "D. pulicaria", "D. retrocurva"))
+    #annotate(geom="text", x=1, y=1.75, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=2, y=1.75, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=3, y=2.5, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=4, y=2.5, label=c(""), color="black", size=15)+
+    #annotate(geom="text", x=5, y=1.75, label=c("**"), color="black", size=15)
+micg_clutchsize_fig
+
+```
+
+```{r, micg_presense_size_plots}
+# Create a dummy blank plot for the legend space and format the legend so that it fits into the provided space. 
+legend <- get_legend(micg_diff_fig + theme(legend.position = "right", 
+                                           legend.text =element_text(size=7),
+                                           legend.title = element_text(size=8),
+                                           legend.spacing=unit(0.1,"cm"),
+                                           legend.key.size = unit(0.3, "cm"),
+                                           legend.margin = margin(0,0,0,0))+
+                       guides(color=guide_legend(order=1, ncol=3),
+                              size=guide_legend(order=2, nrow=1)))
+#make the legend into a plot 
+legend_plot <- as_ggplot(legend)
+legend_plot
+
+ggarrange(micg_diff_fig, legend_plot,
+          micg_clutch_presence_plot, micg_clutchsize_fig,
+          ncol=2, nrow=2)
+```
+
+######################PAST################################
+
+```{r, calculate_differences_past}
+#separate out uninfected animals that are specific to past data set 
+past_uninf <- past[past$Parasite=="Uninfected",]
+
+#for later on, create a column for clutch presence/absence
+#create new column for clutch presence absence using dplyr
+past$clutchyn <- ifelse(past$Egg.Number>0,1,0)
+
+#calculate means for uninfected animals
+mean_past_uninf <- past_uninf %>%  dplyr::group_by(Host.Species, Lake.Name, julian) %>% 
+   dplyr::summarise(mean_egg_uninf=mean(Egg.Number), sd_uninf=sd(Egg.Number), n_uninf = n(),
+    se_uninf = sd_uninf / sqrt(n_uninf))
+mean_past_uninf
+
+#join this averaged data to the infected animals, then calculate a difference for individual animals
+past_differences_all <- past %>%
+  filter(Parasite == 'Past') %>%
+  left_join(mean_past_uninf, by = c('Host.Species', 'Lake.Name', 'julian')) %>%
+  mutate(Difference = Egg.Number - mean_egg_uninf)
+
+table(past_differences_all$Host.Species)
+
+#remove observations from dates where the number of uninfected animals was less <5. 
+past_differences <- past_differences_all %>%
+  filter(n_uninf >= 4)
+#new data set has 2057 rows, meaning we removed 7 observations using this filtering ste
+
+#ok now we have a column which shows the difference between each infected individual's egg count and the average uninfected egg count for the specieslakeday corresponding to that infected animal. Now we should just have to take the average of that column by host species and plot? 
+mean_past_all<- past_differences %>%  dplyr::group_by(Host.Species) %>% 
+   dplyr::summarise(mean_diff=mean(Difference), sd_diff=sd(Difference), n_diff = n(),
+    se_diff = sd_diff / sqrt(n_diff))
+mean_past_all
+
+#filter out any host species which had less than 5 observations of infected animals
+mean_past_diffs <- mean_past_all %>% filter(n_diff>=4)
+mean_past_diffs
+all_past_diffs_filt <- past_differences
+#Create a new table of all differences without parv or dubia
+#try not removing mendotae
+#all_past_diffs_filt <- past_differences %>%
+    #filter(!Host.Species %in% c("Mendotae"))
+
+#create a dataframe from the filtered differences above) which averages by specieslakeday rather than just host species. This is to simplify the representation of the data in the final figure, since there are over 1000 data points in some cases
+mean_ind_differences<- all_past_diffs_filt %>%  dplyr::group_by(Host.Species, Lake.Name, julian) %>% 
+   dplyr::summarise(mean_sld=mean(Difference), sd_sld=sd(Difference), n_sld = n(),
+    se_sld = sd_sld / sqrt(n_sld))
+mean_ind_differences$Host.Species
+
+#ok, now we have a summary data frame which has the totaled average of the difference between individual infected egg counts and uninfected average egg counts for that day. 
+#on top of the plot of this average, I am going to plot each individual difference color coded by lake and shaded by julian day
+pd <- position_dodge(0.5)
+
+past_diff_fig <-ggplot(mean_past_diffs, aes(x=Host.Species, y=mean_diff)) + 
+    geom_jitter(data = mean_ind_differences, aes(x = Host.Species, y = mean_sld, color=Lake.Name, size=n_sld),
+    position = position_jitter(width = 0.2)) +
+  scale_color_manual(values = colors_lakes, name="Lake Name")+
+  #scale_alpha_continuous(range=c(0.3,0.85), name="Julian Day")+
+   scale_size_continuous(range=c(1,5), limits=c(1,140), breaks=c(10,25,50,100,125), name="Number Infected Animals")+
+  geom_errorbar(aes(ymin=mean_diff-se_diff, ymax=mean_diff+se_diff), width=.2, size=0.5, position=pd, color="black") +
+    geom_point(position=pd, size=3, color="black", shape=18)+
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    labs(title="All Animals")+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+    legend.position = "none", #legend.text=element_text(size=22),
+    axis.text.x=element_text(size=7, color="black", angle = 25, vjust = 1, hjust=1), 
+    axis.text.y=element_text(size=7, color="black"),
+    axis.title=element_text(size=8,face="bold"),
+    plot.title = element_text(hjust=1, vjust = 1, size=7))+
+    #legend.key=element_rect(fill="white"))+
+    #guides(color = guide_legend(title = ""))+
+    ylab("Pas. ramosa Inf-Uninf Egg Count")+
+    xlab("")+
+    ylim(-3,3)+
+    scale_x_discrete(labels=c("D. dentifera", "D. mendotae", "D. parvula", "D. pulicaria", "D. retrocurva"))
+    #annotate(geom="text", x=1, y=1.75, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=2, y=1.75, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=3, y=2.5, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=4, y=2.5, label=c(""), color="black", size=15)+
+    #annotate(geom="text", x=5, y=1.75, label=c("**"), color="black", size=15)
+past_diff_fig
+
+#some changes need to be made for the summary figure plot (which is just the overall plot)
+past_diff_sum_fig <- past_diff_fig +
+                            labs(title="Pas. ramosa")+
+                            theme(plot.title=element_text(hjust=0.5, vjust=1, size=7))
+past_diff_sum_fig
+```
+Clutch presence past
+
+```{r, clutch_presence_past}
+#now, I need to create a summary dataset that indicates the number of individuals unique to each specieslakedate as well as the proportion of each infecstatusspecieslakedate that had eggs 
+#pivot wider so that each specieslakeday has one row rather than one for each infection status
+
+past_clutch_presence <- past %>%
+  group_by(Parasite, specieslakeday) %>%
+  dplyr::summarise(
+    proportion = mean(clutchyn),
+    count = n(),
+    .groups="drop"
+  ) %>%
+  pivot_wider(
+    names_from = Parasite,
+    values_from = c(proportion,count)
+  )
+
+
+#remove any row where the count for either infected or uninfect was less than 5
+past_clutch_presence_filt <- past_clutch_presence %>%
+  filter(count_Past>=4,count_Uninfected>=4)
+
+#ok, now we need to create the difference between proportion of animals with a clutch for uninfected-infected
+past_clutch_presence_filt$diff <- past_clutch_presence_filt$proportion_Past-past_clutch_presence_filt$proportion_Uninfected
+
+#now in order to take the mean of these differences by host I need to separate out hosts again
+past_clutch_presence_filt <- past_clutch_presence_filt %>%
+  mutate(hostspecies = word(specieslakeday, 1),
+         lake=word(specieslakeday,2),
+         julian=word(specieslakeday,3)
+  )
+
+#change class of julian after extraction from specieslakeday
+past_clutch_presence_filt$julian <- as.numeric(past_clutch_presence_filt$julian)
+
+#create yet another summary table where the mean of the calculated difference in proportions is taken
+sum_past_clutchyn <- past_clutch_presence_filt %>%
+  group_by(hostspecies) %>%
+  dplyr::summarise(
+    n=n(),
+    mean_diff=mean(diff, na.rm=TRUE),
+    sd_diff=sd(diff,na.rm=TRUE),
+    se_diff=sd_diff/sqrt(n)
+  )
+
+#ok, now I want to graph the mean differences out for past
+past_clutch_presence_plot <- ggplot(sum_past_clutchyn, aes(x = hostspecies, y = mean_diff)) +
+  geom_jitter(
+    data = past_clutch_presence_filt, 
+    aes(x = hostspecies, y = diff, color = lake), 
+    position = position_jitter(width = 0.2), 
+    size = 2
+  ) +
+   geom_point(size = 3, color = "black", shape = 18) +  # Add points for mean differences
+  geom_errorbar(
+    aes(ymin = mean_diff - se_diff, ymax = mean_diff + se_diff), 
+    width = .2, size = 0.5, color = "black"
+  ) +
+  scale_color_manual(values = colors_lakes, name = "lake") +
+  #scale_alpha_continuous(range = c(0.3, 0.85)) +
+  scale_size_continuous(range = c(1, 4)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  
+  labs(title="Clutch Presence") +
+   theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+    legend.position = "none", #legend.text=element_text(size=22),
+    axis.text.x=element_text(size=7, color="black", angle = 25, vjust = 1, hjust=1), 
+    axis.text.y=element_text(size=7, color="black"),
+    axis.title=element_text(size=8,face="bold"),
+    plot.title=element_text(hjust=1, vjust=1, size=7))+
+    #legend.key=element_rect(fill="white"))+
+    #guides(color = guide_legend(title = ""))+
+    ylab("Inf-Uninf Proportion with Clutch")+
+    xlab("")+
+    ylim(-1,1)+
+    scale_x_discrete(labels=c("D. dentifera", "D.mendotae", "D. parvula", "D. pulicaria", "D. retrocurva"))
+
+past_clutch_presence_plot
+
+```
+
+```{r, clutch_size_past}
+#Create a data frame with only animals (infected & uninfected) that have clutches
+past_clutch_size_all <- past[past$clutchyn==1,]
+
+#separate out uninfected animals that are specific to past data set 
+past_uninf_wclutch <- past_clutch_size_all[past_clutch_size_all$Parasite=="Uninfected",]
+
+#calculate means for uninfected animals
+mean_past_uninf_wclutch <- past_uninf_wclutch %>%  dplyr::group_by(Host.Species, Lake.Name, julian) %>% 
+   dplyr::summarise(mean_egg_uninf=mean(Egg.Number), sd_uninf=sd(Egg.Number), n_uninf = n(),
+    se_uninf = sd_uninf / sqrt(n_uninf))
+mean_past_uninf_wclutch
+
+#join this averaged data to the infected animals, then calculate a difference for individual animals
+past_wclutch_differences_all <- past_clutch_size_all %>%
+  filter(Parasite == 'Past') %>%
+  left_join(mean_past_uninf_wclutch, by = c('Host.Species', 'Lake.Name', 'julian')) %>%
+  mutate(Difference = Egg.Number - mean_egg_uninf)
+
+#remove observations from dates where the number of uninfected animals was less <5. 
+past_wclutch_differences <- past_wclutch_differences_all %>%
+  filter(n_uninf >= 4)
+
+#ok now we have a column which shows the difference between each infected individual's egg count and the average uninfected egg count for the specieslakeday corresponding to that infected animal. Now we should just have to take the average of that column by host species and plot? 
+mean_past_wclutch_all<- past_wclutch_differences %>%  dplyr::group_by(Host.Species) %>% 
+   dplyr::summarise(mean_diff=mean(Difference), sd_diff=sd(Difference), n_diff = n(),
+    se_diff = sd_diff / sqrt(n_diff))
+mean_past_wclutch_all
+
+#filter out any host species which had less than 4 observations of infected animals
+mean_past_wclutch_diffs <- mean_past_wclutch_all %>% filter(n_diff>=4)
+
+
+#now we need the individual differences 
+past_clutch_size_ind_differences<- past_wclutch_differences %>%  dplyr::group_by(Host.Species, Lake.Name, julian) %>% 
+   dplyr::summarise(mean_sld=mean(Difference), sd_sld=sd(Difference), n_sld = n(),
+    se_sld = sd_sld / sqrt(n_sld))
+past_clutch_size_ind_differences
+
+#filter out hots 
+past_clutch_size_ind_differences <- past_clutch_size_ind_differences %>%
+    filter(!Host.Species %in% c("Dubia"))
+
+
+
+#ok, now we have a data frame with the overall means as well as the individual means, so now it is time to make the same plot as the overall difference plot
+pd <- position_dodge(0.5)
+
+past_clutchsize_fig <-ggplot(mean_past_wclutch_diffs, aes(x=Host.Species, y=mean_diff)) + 
+    geom_jitter(data = past_clutch_size_ind_differences, aes(x = Host.Species, y = mean_sld,     color=Lake.Name,  size=n_sld),
+    position = position_jitter(width = 0.25)) +
+  scale_color_manual(values = colors_lakes, name="Lake Name")+
+  #scale_alpha_continuous(range=c(0.3,0.85))+
+  #scale_size_continuous(range=c(1,4))+
+  scale_size_continuous(range=c(1,5), limits=c(1,140), breaks=c(10,25,50,100,125), name="Number Infected Animals")+
+  geom_errorbar(aes(ymin=mean_diff-se_diff, ymax=mean_diff+se_diff), width=.2, size=0.5, position=pd, color="black") +
+    geom_point(position=pd, size=3, color="black", shape=18)+
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    labs(title="Clutch Size >=1")+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+    legend.position = "none", #legend.text=element_text(size=22),
+    axis.text.x=element_text(size=7, color="black", angle = 25, vjust = 1, hjust=1), 
+    axis.text.y=element_text(size=7, color="black"),
+    axis.title=element_text(size=8, face="bold"),
+    plot.title = element_text(hjust=1, vjust=1, size=7))+
+    #legend.key=element_rect(fill="white"))+
+    #guides(color = guide_legend(title = ""))+
+    ylab("Pas. ramosa Inf-Uninf Egg Count")+
+    xlab("")+
+    ylim(-3,3)+
+    scale_x_discrete(labels=c("D. dentifera", "D. mendotae", "D. parvula", "D. pulicaria", "D. retrocurva"))
+    #annotate(geom="text", x=1, y=1.75, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=2, y=1.75, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=3, y=2.5, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=4, y=2.5, label=c(""), color="black", size=15)+
+    #annotate(geom="text", x=5, y=1.75, label=c("**"), color="black", size=15)
+past_clutchsize_fig
+
+```
+
+```{r, past_presense_size_plots}
+# Create a dummy blank plot for the legend space and format the legend so that it fits into the provided space. 
+legend <- get_legend(past_diff_fig + theme(legend.position = "right", 
+                                           legend.text =element_text(size=7),
+                                           legend.title = element_text(size=8),
+                                           legend.spacing=unit(0.1,"cm"),
+                                           legend.key.size = unit(0.3, "cm"),
+                                           legend.margin = margin(0,0,0,0))+
+                       guides(color=guide_legend(order=1, ncol=3),
+                              size=guide_legend(order=2, nrow=1)))
+#make the legend into a plot 
+legend_plot <- as_ggplot(legend)
+legend_plot
+
+ggarrange(past_diff_fig, legend_plot,
+          past_clutch_presence_plot, past_clutchsize_fig,
+          ncol=2, nrow=2)
+```
+
+#################BROOD#######################
+```{r, calculate_differences_brood}
+#separate out uninfected animals that are specific to brood data set 
+brood_uninf <- brood[brood$Parasite=="Uninfected",]
+
+#for later on, create a column for clutch presence/absence
+#create new column for clutch presence absence using dplyr
+brood$clutchyn <- ifelse(brood$Egg.Number>0,1,0)
+
+#calculate means for uninfected animals
+mean_brood_uninf <- brood_uninf %>%  dplyr::group_by(Host.Species, Lake.Name, julian) %>% 
+   dplyr::summarise(mean_egg_uninf=mean(Egg.Number), sd_uninf=sd(Egg.Number), n_uninf = n(),
+    se_uninf = sd_uninf / sqrt(n_uninf))
+mean_brood_uninf
+
+#join this averaged data to the infected animals, then calculate a difference for individual animals
+brood_differences_all <- brood %>%
+  filter(Parasite == 'Brood') %>%
+  left_join(mean_brood_uninf, by = c('Host.Species', 'Lake.Name', 'julian')) %>%
+  mutate(Difference = Egg.Number - mean_egg_uninf)
+
+table(brood_differences_all$Host.Species)
+
+#remove observations from dates where the number of uninfected animals was less <5. 
+brood_differences <- brood_differences_all %>%
+  filter(n_uninf >= 4)
+#new data set has 2057 rows, meaning we removed 7 observations using this filtering ste
+table(brood_differences$Host.Species)
+#ok now we have a column which shows the difference between each infected individual's egg count and the average uninfected egg count for the specieslakeday corresponding to that infected animal. Now we should just have to take the average of that column by host species and plot? 
+mean_brood_all<- brood_differences %>%  dplyr::group_by(Host.Species) %>% 
+   dplyr::summarise(mean_diff=mean(Difference), sd_diff=sd(Difference), n_diff = n(),
+    se_diff = sd_diff / sqrt(n_diff))
+mean_brood_all
+
+#filter out any host species which had less than 5 observations of infected animals
+mean_brood_diffs <- mean_brood_all %>% filter(n_diff>=4)
+mean_brood_diffs
+all_brood_diffs_filt <- brood_differences
+#Create a new table of all differences without parv or dubia
+#try not removing mendotae
+all_brood_diffs_filt <- brood_differences %>%
+    filter(!Host.Species %in% c("Mendotae", "Ambigua","Parvula"))
+
+#create a dataframe from the filtered differences above) which averages by specieslakeday rather than just host species. This is to simplify the representation of the data in the final figure, since there are over 1000 data points in some cases
+mean_ind_differences<- all_brood_diffs_filt %>%  dplyr::group_by(Host.Species, Lake.Name, julian) %>% 
+   dplyr::summarise(mean_sld=mean(Difference), sd_sld=sd(Difference), n_sld = n(),
+    se_sld = sd_sld / sqrt(n_sld))
+mean_ind_differences$Host.Species
+
+#ok, now we have a summary data frame which has the totaled average of the difference between individual infected egg counts and uninfected average egg counts for that day. 
+#on top of the plot of this average, I am going to plot each individual difference color coded by lake and shaded by julian day
+pd <- position_dodge(0.5)
+
+brood_diff_fig <-ggplot(mean_brood_diffs, aes(x=Host.Species, y=mean_diff)) + 
+    geom_jitter(data = mean_ind_differences, aes(x = Host.Species, y = mean_sld,     color=Lake.Name, size=n_sld),
+    position = position_jitter(width = 0.2)) +
+  scale_color_manual(values = colors_lakes, name="Lake Name")+
+  #scale_alpha_continuous(range=c(0.3,0.85), name="Julian Day")+
+ scale_size_continuous(range=c(1,5), limits=c(1,140), breaks=c(10,25,50,100,125), name="Number Infected Animals")+
+  geom_errorbar(aes(ymin=mean_diff-se_diff, ymax=mean_diff+se_diff), width=.2, size=0.5, position=pd, color="black") +
+    geom_point(position=pd, size=3, color="black", shape=18)+
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    labs(title="All Animals")+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+    legend.position = "none", #legend.text=element_text(size=22),
+    axis.text.x=element_text(size=7, color="black", angle = 25, vjust = 1, hjust=1), 
+    axis.text.y=element_text(size=7, color="black"),
+    axis.title=element_text(size=8,face="bold"),
+    plot.title = element_text(hjust=1, vjust = 1, size=7))+
+    #legend.key=element_rect(fill="white"))+
+    #guides(color = guide_legend(title = ""))+
+    ylab("B. paedophthorum Inf-Uninf Egg Count")+
+    xlab("")+
+    ylim(-3,3)+
+    scale_x_discrete(labels=c("C. dubia", "D. dentifera", "D. dubia", "D. pulicaria", "D. retrocurva"))
+    #annotate(geom="text", x=1, y=1.75, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=2, y=1.75, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=3, y=2.5, label=c("***"), color="black", size=15)+
+    #annotate(geom="text", x=4, y=2.5, label=c(""), color="black", size=15)+
+    #annotate(geom="text", x=5, y=1.75, label=c("**"), color="black", size=15)
+brood_diff_fig
+
+
+#some changes need to be made for the summary figure plot (which is just the overall plot)
+brood_diff_sum_fig <- brood_diff_fig +
+                            labs(title="B. paedophthorum")+
+                            theme(plot.title=element_text(hjust=0.5, vjust=1, size=7))
+brood_diff_sum_fig
+
+```
+
+
+```{r, clutch_presence_brood}
+#now, I need to create a summary dataset that indicates the number of individuals unique to each specieslakedate as well as the proportion of each infecstatusspecieslakedate that had eggs 
+#pivot wider so that each specieslakeday has one row rather than one for each infection status
+
+brood_clutch_presence <- brood %>%
+  group_by(Parasite, specieslakeday) %>%
+  dplyr::summarise(
+    proportion = mean(clutchyn),
+    count = n(),
+    .groups="drop"
+  ) %>%
+  pivot_wider(
+    names_from = Parasite,
+    values_from = c(proportion,count)
+  )
+
+
+#remove any row where the count for either infected or uninfect was less than 5
+brood_clutch_presence_filt <- brood_clutch_presence %>%
+  filter(count_Brood>=4,count_Uninfected>=4)
+
+#ok, now we need to create the difference between proportion of animals with a clutch for uninfected-infected
+brood_clutch_presence_filt$diff <- brood_clutch_presence_filt$proportion_Brood-brood_clutch_presence_filt$proportion_Uninfected
+
+#now in order to take the mean of these differences by host I need to separate out hosts again
+brood_clutch_presence_filt <- brood_clutch_presence_filt %>%
+  mutate(hostspecies = word(specieslakeday, 1),
+         lake=word(specieslakeday,2),
+         julian=word(specieslakeday,3)
+  )
+
+
+#change class of julian after extraction from specieslakeday
+brood_clutch_presence_filt$julian <- as.numeric(brood_clutch_presence_filt$julian)
+
+#create yet another summary table where the mean of the calculated difference in proportions is taken
+sum_brood_clutchyn <- brood_clutch_presence_filt %>%
+  group_by(hostspecies) %>%
+  dplyr::summarise(
+    n=n(),
+    mean_diff=mean(diff, na.rm=TRUE),
+    sd_diff=sd(diff,na.rm=TRUE),
+    se_diff=sd_diff/sqrt(n)
+  )
+
+#try to add in pulicaria as it is a dropped factor
+
+sum_brood_clutchyn <- dplyr::bind_rows(
+  sum_brood_clutchyn,
+  tibble::tibble(hostspecies = "Pulicaria", n=NA_real_, mean_diff = NA_real_, sd_diff=NA_real_, se_diff=NA_real_)
+)
+desired_levels <- c("Cerio", "Dentifera", "Dubia", "Pulicaria", "Retrocurva")
+
+sum_brood_clutchyn$hostspecies <- factor(sum_brood_clutchyn$hostspecies, levels = desired_levels)
+
+
+#ok, now I want to graph the mean differences out for brood
+brood_clutch_presence_plot <- ggplot(sum_brood_clutchyn, aes(x = hostspecies, y = mean_diff)) +
+  geom_jitter(
+    data = brood_clutch_presence_filt, 
+    aes(x = hostspecies, y = diff, color = lake), 
+    position = position_jitter(width = 0.2), 
+    size = 2
+  ) +
+   geom_point(size = 3, color = "black", shape = 18) +  # Add points for mean differences
+  geom_errorbar(
+    aes(ymin = mean_diff - se_diff, ymax = mean_diff + se_diff), 
+    width = .2, size = 0.5, color = "black"
+  ) +
+  scale_color_manual(values = colors_lakes, name = "lake") +
+  #scale_alpha_continuous(range = c(0.3, 0.85)) +
+  #scale_size_continuous(range = c(1, 4)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  
+  labs(title="Clutch Presence") +
+   theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+    legend.position = "none", #legend.text=element_text(size=22),
+    axis.text.x=element_text(size=7, color="black", angle = 25, vjust = 1, hjust=1), 
+    axis.text.y=element_text(size=7, color="black"),
+    axis.title=element_text(size=8,face="bold"),
+    plot.title=element_text(hjust=1, vjust=1, size=7))+
+    #legend.key=element_rect(fill="white"))+
+    #guides(color = guide_legend(title = ""))+
+    ylab("Inf-Uninf Proportion with Clutch")+
+    xlab("")+
+    ylim(-1,1)+
+    scale_x_discrete(labels=c("C. dubia", "D.dentifera", "D. dubia", "D. pulicaria", "D. retrocurva"))
+
+brood_clutch_presence_plot
+
+```
+
+```{r, clutch_size_brood}
+#Create a data frame with only animals (infected & uninfected) that have clutches
+brood_clutch_size_all <- brood[brood$clutchyn==1,]
+
+#separate out uninfected animals that are specific to brood data set 
+brood_uninf_wclutch <- brood_clutch_size_all[brood_clutch_size_all$Parasite=="Uninfected",]
+
+#calculate means for uninfected animals
+mean_brood_uninf_wclutch <- brood_uninf_wclutch %>%  dplyr::group_by(Host.Species, Lake.Name, julian) %>% 
+   dplyr::summarise(mean_egg_uninf=mean(Egg.Number), sd_uninf=sd(Egg.Number), n_uninf = n(),
+    se_uninf = sd_uninf / sqrt(n_uninf))
+mean_brood_uninf_wclutch
+
+#join this averaged data to the infected animals, then calculate a difference for individual animals
+brood_wclutch_differences_all <- brood_clutch_size_all %>%
+  filter(Parasite == 'Brood') %>%
+  left_join(mean_brood_uninf_wclutch, by = c('Host.Species', 'Lake.Name', 'julian')) %>%
+  mutate(Difference = Egg.Number - mean_egg_uninf)
+
+#remove observations from dates where the number of uninfected animals was less <5. 
+brood_wclutch_differences <- brood_wclutch_differences_all %>%
+  filter(n_uninf >= 5)
+
+#ok now we have a column which shows the difference between each infected individual's egg count and the average uninfected egg count for the specieslakeday corresponding to that infected animal. Now we should just have to take the average of that column by host species and plot? 
+mean_brood_wclutch_all<- brood_wclutch_differences %>%  dplyr::group_by(Host.Species) %>% 
+   dplyr::summarise(mean_diff=mean(Difference), sd_diff=sd(Difference), n_diff = n(),
+    se_diff = sd_diff / sqrt(n_diff))
+mean_brood_wclutch_all
+
+#filter out any host species which had less than 4 observations of infected animals
+mean_brood_wclutch_diffs <- mean_brood_wclutch_all %>% filter(n_diff>=4)
+
+
+#now we need the individual differences 
+brood_clutch_size_ind_differences<- brood_wclutch_differences %>%  dplyr::group_by(Host.Species, Lake.Name, julian) %>% 
+   dplyr::summarise(mean_sld=mean(Difference), sd_sld=sd(Difference), n_sld = n(),
+    se_sld = sd_sld / sqrt(n_sld))
+brood_clutch_size_ind_differences
+
+#filter out hosts 
+brood_clutch_size_ind_differences <- brood_clutch_size_ind_differences %>%
+    filter(!Host.Species %in% c("Ambigua", "Mendotae","Parvula"))
+
+
+#try to add in the host species that we don't have (cerio) as it is a dropped factor
+
+brood_clutch_size_ind_differences <- dplyr::bind_rows(
+  brood_clutch_size_ind_differences,
+  tibble::tibble(Host.Species = "Cerio", Lake.Name=NA, julian = NA_real_, mean_sld=NA_real_, sd_sld=NA_real_, n_sld=NA_real_, se_sld=NA_real_)
+)
+desired_levels <- c("Cerio", "Dentifera", "Dubia", "Pulicaria", "Retrocurva")
+
+brood_clutch_size_ind_differences$Host.Species <- factor(brood_clutch_size_ind_differences$Host.Species, levels = desired_levels)
+
+#ok, now we have a data frame with the overall means as well as the individual means, so now it is time to make the same plot as the overall difference plot
+pd <- position_dodge(0.5)
+
+brood_clutchsize_fig <- ggplot(
+  brood_clutch_size_ind_differences,
+  aes(x = Host.Species, y = mean_sld, color = Lake.Name, size = n_sld)
+) +
+  geom_point() +
+  scale_color_manual(values = colors_lakes, name = "Lake Name") +
+  scale_size_continuous(range = c(1,5), limits = c(1,140),
+                        breaks = c(10,25,50,100,125),
+                        name = "Number Infected Animals") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  labs(title = "Clutch Size >=1") +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black"),
+    legend.position = "none",
+    axis.text.x = element_text(size=7, color="black", angle=25, vjust=1, hjust=1),
+    axis.text.y = element_text(size=7, color="black"),
+    axis.title = element_text(size=8, face="bold"),
+    plot.title = element_text(hjust=1, vjust=1, size=7)
+  ) +
+  ylab("B. paedophthorum Inf-Uninf Egg Count") +
+  xlab("") +
+  coord_cartesian(ylim = c(-3, 3)) +
+  scale_x_discrete(labels = c("C. dubia", "D. dentifera", "D. dubia", "D. pulicaria", "D. retrocurva"))
+
+brood_clutchsize_fig
+
+```
+
+
+
+
+Main Figure Code
+
+```{r}
+#arrange just the inf difference plots and add titles to each
+#rename lakes to shorten everything
+
+
+step1 <-ggarrange(coke_diff_sum_fig, micg_diff_sum_fig,
+          past_diff_sum_fig, brood_diff_sum_fig,
+          ncol=2, nrow=2, labels="AUTO", hjust=-2)
+
+step1
+
+
+
+legend <- get_legend(
+  micg_diff_fig +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.box = "horizontal",   # stacks multiple legends
+      legend.text = element_text(size = 7),
+      legend.title = element_text(size = 8),
+      legend.spacing.x = unit(0.2, "cm"),
+      legend.key.size = unit(0.3, "cm"),
+      legend.margin = margin(0, 0, 0, 0)
+    ) +
+    guides(
+      color = guide_legend(order = 1, nrow = 2),
+      size  = guide_legend(order = 2, nrow = 1)
+    )
+)
+
+final_plot <- ggarrange(
+  step1,
+  legend,
+  ncol = 1,
+  heights = c(1, 0.15)  # adjust legend height here
+)
+final_plot
+
+ggsave("summary_allparasites.png", plot = final_plot, width = 9, height = 7, dpi = 600, bg="white")
+
+
+```
+
+
+
+Summary Figure (Appendix Figure)
+
+```{r}
+
+# label each plot
+tag_inside_yaxis <- function(p, lab, x = 0.02, y = 0.98, size = 12) {
+  ggdraw(p) +
+    draw_label(lab, x = x, y = y, hjust = -1, vjust=1,
+               fontface = "bold", size = size)
+}
+
+plots <- list(
+  coke_diff_fig, coke_clutch_presence_plot, coke_clutchsize_fig,
+  micg_diff_fig, micg_clutch_presence_plot, micg_clutchsize_fig,
+  past_diff_fig, past_clutch_presence_plot, past_clutchsize_fig,
+  brood_diff_fig, brood_clutch_presence_plot, brood_clutchsize_fig
+)
+
+plots_tagged <- Map(tag_inside_yaxis, plots, LETTERS[1:12])
+
+# row label (left side)
+row_label <- function(txt, size = 10, angle = 90) {
+  ggplot() +
+    annotate("text", x = 0, y = 0, label = txt, fontface = "bold",
+             size = size/ggplot2::.pt, angle = angle, hjust = 0.5, vjust = 0.5) +
+    theme_void() +
+    coord_cartesian(clip = "off")
+}
+
+row1 <- plot_grid(row_label("Pan. perplexa",  angle = 90),
+                  plots_tagged[[1]], plots_tagged[[2]], plots_tagged[[3]],
+                  nrow = 1, rel_widths = c(0.35, 1, 1, 1))
+
+row2 <- plot_grid(row_label("O. pajunii",     angle = 90),
+                  plots_tagged[[4]], plots_tagged[[5]], plots_tagged[[6]],
+                  nrow = 1, rel_widths = c(0.35, 1, 1, 1))
+
+row3 <- plot_grid(row_label("Pas. ramosa",    angle = 90),
+                  plots_tagged[[7]], plots_tagged[[8]], plots_tagged[[9]],
+                  nrow = 1, rel_widths = c(0.35, 1, 1, 1))
+
+row4 <- plot_grid(row_label("B. paedophthorum", angle = 90),
+                  plots_tagged[[10]], plots_tagged[[11]], plots_tagged[[12]],
+                  nrow = 1, rel_widths = c(0.35, 1, 1, 1))
+
+final_no_legend <- plot_grid(row1, row2, row3, row4, ncol = 1)
+
+# add legend at bottom (legend must be a grob/ggplot)
+final_supp <- ggarrange(final_no_legend, legend, ncol = 1, heights = c(1, 0.1))
+final_supp
+
+ggsave("supp_allparasites.png", plot = final_supp, width = 10, height = 12, dpi = 600, bg="white")
+
+
+```
+
+
+
+
+
